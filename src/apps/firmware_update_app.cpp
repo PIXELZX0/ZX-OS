@@ -329,7 +329,7 @@ bool parseLatestReleaseBody(const String &body,
 bool parseReleaseCatalogBody(const String &body,
                              ReleaseInfo &infoOut,
                              String *error) {
-  DynamicJsonDocument doc(65536);
+  DynamicJsonDocument doc(16384);
   const auto parseErr = deserializeJson(doc, body);
   if (parseErr || !doc.is<JsonArrayConst>()) {
     if (error) {
@@ -500,7 +500,7 @@ bool downloadUrlToSdFile(const String &url,
 
   WiFiClient *stream = http.getStreamPtr();
   int remain = http.getSize();
-  uint8_t buffer[kTransferChunkBytes];
+  static uint8_t buffer[kTransferChunkBytes];
   uint32_t writtenTotal = 0;
   unsigned long lastProgressMs = millis();
   if (progressTick) {
@@ -628,7 +628,7 @@ bool installFirmwareFromSd(const String &path,
     return false;
   }
 
-  uint8_t buffer[kTransferChunkBytes];
+  static uint8_t buffer[kTransferChunkBytes];
   size_t writtenTotal = 0;
   if (progressTick) {
     progressTick(0, size);
