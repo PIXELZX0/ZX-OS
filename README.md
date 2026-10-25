@@ -9,12 +9,15 @@ It combines a launcher-based LVGL UI with wireless tooling, OpenClaw gateway int
 - Configuration persistence across reboot (SD + NVS fallback).
 - OpenClaw gateway connectivity (`ws://` and `wss://`) with token/password auth.
 - Wireless modules and utility apps (RF/CC1101, NFC, RFID, NRF24, BLE).
+- A JavaScript (Duktape/ES5.1) scripting framework (`ir`/`nfc`/`cc1101`/`gpio`/`fs`/`ui`) for scripting IR, NFC and sub-GHz without recompiling — see `docs/FEATURES.md` §7.
 - SD-card utilities including browsing, previewing media, and package-based updates.
 
 > For full feature details and developer workflows, read:
 >
 > - `docs/FEATURES.md`
 > - `docs/APP_DEVELOPMENT_GUIDE.md`
+
+Third-party: the JS framework vendors [Duktape](https://duktape.org/) (MIT) under `lib/duktape/`.
 
 ## Web Flusher
 

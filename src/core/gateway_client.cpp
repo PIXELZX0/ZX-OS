@@ -657,6 +657,7 @@ void GatewayClient::sendConnectRequest() {
   JsonArray caps = params.createNestedArray("caps");
   caps.add("rf");
   caps.add("cc1101");
+  caps.add("js");
 
   JsonArray commands = params.createNestedArray("commands");
   commands.add("system.which");
@@ -669,6 +670,8 @@ void GatewayClient::sendConnectRequest() {
   commands.add("cc1101.packet_set");
   commands.add("cc1101.packet_tx_text");
   commands.add("cc1101.packet_rx_once");
+  commands.add("js.eval");
+  commands.add("js.run_file");
 
   JsonObject auth = params.createNestedObject("auth");
   if (usePassword) {

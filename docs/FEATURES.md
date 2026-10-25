@@ -188,3 +188,57 @@ Storage/load behavior:
 - Mark configuration edits with `ctx.configDirty = true` and persist via save/apply flows.
 - For SPI peripherals, follow shared bus/CS discipline to avoid contention.
 
+
+## 7. JS scripting framework (`src/core/js/*`, `JS Console` app)
+
+ZX-OS embeds [Duktape](https://duktape.org/) (ES5.1 + typed arrays, MIT
+licensed, vendored under `lib/duktape/`) so IR, NFC and CC1101 can be driven
+from plain JavaScript instead of recompiling firmware.
+
+- **Where scripts live**: `/scripts/*.js` on the SD card. The `JS Console`
+  launcher entry lists them, runs the selected one, and shows `print()`
+  output plus the final value or error. A `sample.js` is created on first
+  use.
+- **Remote execution**: the OpenClaw gateway accepts `js.eval` (inline
+  `source`) and `js.run_file` (SD `path`), both bounded by `timeoutMs`
+  (≤30s) — see `NodeCommandHandler::handleJsCommand`.
+- **Safety**: one script runs at a time; each run gets a wall-clock timeout
+  (aborted via Duktape's interrupt-counter hook, so even `while(true){}`
+  is killed), a heap allocator capped to a slice of PSRAM/internal RAM, and
+  BACK cancels a script running from the launcher. `fs.*` is sandboxed to
+  absolute paths with no `..`; `gpio.*` refuses pins the firmware itself
+  depends on (display/SD/CC1101 SPI, encoder, buttons, I2C, IR, NFC/RFID/
+  NRF24).
+
+### Global API (see `src/core/js/js_mod_*.cpp` for the native side)
+
+- `print(...)`, `console.log/info/warn/error`, `delay(ms)`, `millis()`,
+  `random()`, `toHex(bytes, sep)`, `fromHex(str)`.
+- `sys.board()`, `sys.heapFree()`, `sys.uptimeMs()`.
+- `gpio.mode(pin, "input"|"input_pullup"|"input_pulldown"|"output")`,
+  `gpio.write(pin, 0|1)`, `gpio.read(pin)`, `gpio.analogRead(pin)`,
+  `gpio.pwm(pin, duty0to1, hz)`.
+- `fs.readText(path)`, `fs.readBytes(path)`, `fs.write(path, data, append)`,
+  `fs.remove/mkdir/exists/list(path)`.
+- `ui.toast(title, msg, ms)`, `ui.confirm(title, msg)`, `ui.prompt(title,
+  default)`, `ui.progress(title, msg, percent)`, `ui.hideProgress()`,
+  `ui.status(line)` (only available when a `UiRuntime` is attached, i.e.
+  when run from the launcher).
+- `ir.send(protocol, address, command, repeat)` — `protocol` is one of
+  `"NEC"`, `"NECext"`, `"Samsung32"`, `"SIRC"`/`"SIRC15"`/`"SIRC20"`, `"RC5"`.
+  `ir.sendRaw(timings, carrierHz)`, `ir.receive(timeoutMs)` (returns
+  `{raw, protocol, address, command, toggle}` or `null`),
+  `ir.decode(timings)`, `ir.encode(protocol, address, command)`.
+- `nfc.scan(timeoutMs)` → `{uid, uidHex}` or `null`; `nfc.info()`;
+  `nfc.mifare.auth(uid, block, key6, useKeyB)`, `.read(block)`,
+  `.write(block, data16)`, `.findKey(block, keys, useKeyB)` (dictionary
+  attack helper); `nfc.ntag.readPage(page)` / `.writePage(page, data4)`;
+  `nfc.transceive(apdu)` for raw `InDataExchange`.
+- `cc1101.info()`, `.setFreq(mhz)`, `.setPower(dbm)`, `.readRssi()`,
+  `.readReg(addr)` / `.writeReg(addr, value)` / `.strobe(strobe)` /
+  `.setMode("idle"|"rx"|"tx"|"sleep"|"reset")` for direct register access,
+  `.capture(timeoutMs, minEdges, gapUs)` / `.replay(timings, repeat, gapUs)`
+  for raw OOK/ASK pulse trains (sub-GHz remotes), `.txFixedCode(code, bits,
+  pulseLength, protocol, repeat)` for rc-switch style fixed codes, and
+  `.packetGet()` / `.packetSet(cfg)` / `.send(bytes)` / `.receive(timeoutMs)`
+  for the existing FSK/GFSK packet mode.

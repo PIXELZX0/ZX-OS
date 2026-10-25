@@ -6,6 +6,8 @@
 
 #include <cstring>
 
+#include <esp_timer.h>
+
 #include "board_pins.h"
 #include "shared_spi_bus.h"
 #include "user_config.h"
@@ -27,7 +29,6 @@ constexpr uint8_t CC1101_MISO_PIN = HAL_SPI_MISO;
 constexpr uint8_t CC1101_MOSI_PIN = HAL_SPI_MOSI;
 constexpr uint8_t CC1101_SCK_PIN = HAL_SPI_SCK;
 
-constexpr uint8_t TX_POWER_DBM = 12;
 constexpr float RF_MIN_MHZ = 280.0f;
 constexpr float RF_MAX_MHZ = 928.0f;
 constexpr float RF_SAFE_DEFAULT_MHZ = 433.92f;
@@ -40,10 +41,24 @@ constexpr int CC1101_DEFAULT_TX_DELAY_MS = 25;
 
 constexpr unsigned long CC1101_BOOT_SETTLE_MS = 30UL;
 
+int gTxPowerDbm = 12;
 bool gCc1101Ready = false;
 float gCurrentFrequencyMhz = USER_DEFAULT_RF_FREQUENCY_MHZ;
 Cc1101PacketConfig gPacketConfig;
 RCSwitch gRcSwitch;
+
+constexpr size_t kRawMaxEdges = 1024;
+constexpr size_t kRawMaxTxTimings = 4000;
+volatile uint32_t gRawEdgeUs[kRawMaxEdges];
+volatile size_t gRawEdgeCount = 0;
+
+void IRAM_ATTR onCc1101RawEdge() {
+  const size_t n = gRawEdgeCount;
+  if (n < kRawMaxEdges) {
+    gRawEdgeUs[n] = static_cast<uint32_t>(esp_timer_get_time());
+    gRawEdgeCount = n + 1;
+  }
+}
 
 float clampFrequency(float mhz) {
   if (mhz < RF_MIN_MHZ || mhz > RF_MAX_MHZ) {
@@ -123,7 +138,7 @@ void applyPacketConfigNoValidate(const Cc1101PacketConfig &config) {
   ELECHOUSE_cc1101.setManchester(config.manchester);
   ELECHOUSE_cc1101.setSyncMode(config.syncMode);
   ELECHOUSE_cc1101.setAppendStatus(true);
-  ELECHOUSE_cc1101.setPA(TX_POWER_DBM);
+  ELECHOUSE_cc1101.setPA(gTxPowerDbm);
   ELECHOUSE_cc1101.SetRx();
 }
 
@@ -137,10 +152,35 @@ int clampTxDelayMs(int txDelayMs) {
   return txDelayMs;
 }
 
+// Registers that raw OOK mode temporarily takes over.
+struct RawModeSaved {
+  uint8_t iocfg0;
+  uint8_t pktctrl0;
+};
+
+RawModeSaved enterRawMode() {
+  RawModeSaved saved;
+  saved.iocfg0 = ELECHOUSE_cc1101.SpiReadReg(0x02);
+  saved.pktctrl0 = ELECHOUSE_cc1101.SpiReadReg(0x08);
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.setModulation(2);   // ASK/OOK
+  ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x0D);  // GDO0 = serial data out
+  ELECHOUSE_cc1101.SpiWriteReg(0x08, 0x32);  // async serial, infinite length
+  return saved;
+}
+
+void leaveRawMode(const RawModeSaved &saved) {
+  ELECHOUSE_cc1101.setSidle();
+  ELECHOUSE_cc1101.SpiWriteReg(0x02, saved.iocfg0);
+  ELECHOUSE_cc1101.SpiWriteReg(0x08, saved.pktctrl0);
+  applyPacketConfigNoValidate(gPacketConfig);
+}
+
 }  // namespace
 
 bool initCc1101Radio() {
   gPacketConfig = Cc1101PacketConfig{};
+  gTxPowerDbm = 12;
   gCurrentFrequencyMhz = clampFrequency(gCurrentFrequencyMhz);
 
 #if HAL_HAS_POWER_ENABLE
@@ -371,7 +411,7 @@ bool transmitCc1101(uint32_t code,
   setCc1101FrequencyMhz(gCurrentFrequencyMhz);
 
   ELECHOUSE_cc1101.setModulation(2);
-  ELECHOUSE_cc1101.setPA(TX_POWER_DBM);
+  ELECHOUSE_cc1101.setPA(gTxPowerDbm);
   pinMode(CC1101_GDO0_PIN, OUTPUT);
   ELECHOUSE_cc1101.SetTx();
 
@@ -398,4 +438,222 @@ void appendCc1101Info(JsonObject obj) {
   obj["packetFormat"] = gPacketConfig.packetFormat;
   obj["packetLengthConfig"] = gPacketConfig.lengthConfig;
   obj["packetLength"] = gPacketConfig.packetLength;
+}
+
+bool readCc1101Register(uint8_t addr, uint8_t &value, String &errorOut) {
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  if (addr <= 0x2E) {
+    value = ELECHOUSE_cc1101.SpiReadReg(addr);
+  } else if (addr >= 0x30 && addr <= 0x3D) {
+    value = ELECHOUSE_cc1101.SpiReadStatus(addr);
+  } else {
+    errorOut = "register must be 0x00..0x2E or 0x30..0x3D";
+    return false;
+  }
+  return true;
+}
+
+bool writeCc1101Register(uint8_t addr, uint8_t value, String &errorOut) {
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  if (addr > 0x2E) {
+    errorOut = "writable registers are 0x00..0x2E";
+    return false;
+  }
+  ELECHOUSE_cc1101.SpiWriteReg(addr, value);
+  return true;
+}
+
+bool strobeCc1101(uint8_t strobe, String &errorOut) {
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  if (strobe < 0x30 || strobe > 0x3D) {
+    errorOut = "strobe must be 0x30..0x3D";
+    return false;
+  }
+  ELECHOUSE_cc1101.SpiStrobe(strobe);
+  return true;
+}
+
+bool setCc1101Mode(const String &mode, String &errorOut) {
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  if (mode == "idle") {
+    ELECHOUSE_cc1101.setSidle();
+  } else if (mode == "rx") {
+    ELECHOUSE_cc1101.SetRx();
+  } else if (mode == "tx") {
+    ELECHOUSE_cc1101.SetTx();
+  } else if (mode == "sleep") {
+    ELECHOUSE_cc1101.goSleep();
+  } else if (mode == "reset") {
+    ELECHOUSE_cc1101.setSres();
+  } else {
+    errorOut = "mode must be idle, rx, tx, sleep or reset";
+    return false;
+  }
+  return true;
+}
+
+bool setCc1101TxPowerDbm(int dbm, String &errorOut) {
+  static const int kAllowed[] = {-30, -20, -15, -10, -6, 0, 5, 7, 10, 11, 12};
+  bool ok = false;
+  for (int v : kAllowed) {
+    ok = ok || v == dbm;
+  }
+  if (!ok) {
+    errorOut = "power must be one of -30,-20,-15,-10,-6,0,5,7,10,11,12 dBm";
+    return false;
+  }
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  gTxPowerDbm = dbm;
+  ELECHOUSE_cc1101.setPA(dbm);
+  return true;
+}
+
+int getCc1101TxPowerDbm() { return gTxPowerDbm; }
+
+bool captureCc1101Raw(uint32_t timeoutMs,
+                      size_t minEdges,
+                      uint32_t gapUs,
+                      std::vector<uint16_t> &out,
+                      String &errorOut,
+                      const std::function<bool()> &keepWaiting) {
+  out.clear();
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  if (minEdges < 2) {
+    minEdges = 2;
+  }
+  if (minEdges > kRawMaxEdges) {
+    minEdges = kRawMaxEdges;
+  }
+  if (gapUs < 500) {
+    gapUs = 500;
+  }
+
+  const RawModeSaved saved = enterRawMode();
+  ELECHOUSE_cc1101.SetRx();
+  pinMode(CC1101_GDO0_PIN, INPUT);
+  gRawEdgeCount = 0;
+  attachInterrupt(digitalPinToInterrupt(CC1101_GDO0_PIN), onCc1101RawEdge,
+                  CHANGE);
+
+  const uint32_t startMs = millis();
+  bool gotBurst = false;
+  while (millis() - startMs < timeoutMs) {
+    if (keepWaiting && !keepWaiting()) {
+      break;
+    }
+    const size_t n = gRawEdgeCount;
+    if (n > 0) {
+      const uint32_t idle =
+          static_cast<uint32_t>(esp_timer_get_time()) - gRawEdgeUs[n - 1];
+      if (n >= kRawMaxEdges || (idle > gapUs && n >= minEdges)) {
+        gotBurst = true;
+        break;
+      }
+      if (idle > gapUs) {
+        gRawEdgeCount = 0;  // too short: treat as noise and keep listening
+      }
+    }
+    delay(1);
+  }
+  detachInterrupt(digitalPinToInterrupt(CC1101_GDO0_PIN));
+  const bool endsHigh = digitalRead(CC1101_GDO0_PIN) == HIGH;
+  leaveRawMode(saved);
+
+  if (!gotBurst) {
+    return false;
+  }
+  const size_t n = gRawEdgeCount;
+  // Idle is low, so an even edge count must end low; otherwise the capture
+  // started on a stray falling edge.
+  const size_t first = (endsHigh == (n % 2 == 1)) ? 0 : 1;
+  if (n - first < 3) {
+    return false;
+  }
+  size_t count = n - first - 1;
+  if (count % 2 == 0) {
+    --count;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t d = gRawEdgeUs[first + i + 1] - gRawEdgeUs[first + i];
+    out.push_back(static_cast<uint16_t>(d > 0xFFFF ? 0xFFFF : d));
+  }
+  return !out.empty();
+}
+
+bool replayCc1101Raw(const uint16_t *timings,
+                     size_t count,
+                     int repeat,
+                     uint32_t interFrameGapUs,
+                     String &errorOut) {
+  if (!gCc1101Ready) {
+    errorOut = "CC1101 not initialized";
+    return false;
+  }
+  if (!timings || count == 0 || count > kRawMaxTxTimings) {
+    errorOut = "timings must hold 1.." + String(kRawMaxTxTimings) + " entries";
+    return false;
+  }
+  if (repeat < 1 || repeat > 20) {
+    errorOut = "repeat must be 1..20";
+    return false;
+  }
+  if (interFrameGapUs > 2000000) {
+    errorOut = "gap too long (max 2000000 us)";
+    return false;
+  }
+
+  uint32_t totalUs = 0;
+  for (size_t i = 0; i < count; ++i) {
+    totalUs += timings[i];
+  }
+
+  const RawModeSaved saved = enterRawMode();
+  ELECHOUSE_cc1101.setPA(gTxPowerDbm);
+  pinMode(CC1101_GDO0_PIN, OUTPUT);
+  digitalWrite(CC1101_GDO0_PIN, LOW);
+  ELECHOUSE_cc1101.SetTx();
+  delayMicroseconds(1000);  // let the synthesizer settle
+
+  for (int r = 0; r < repeat; ++r) {
+    const bool shortFrame = totalUs <= 150000;
+    if (shortFrame) {
+      noInterrupts();
+    }
+    int64_t next = esp_timer_get_time();
+    for (size_t i = 0; i < count; ++i) {
+      digitalWrite(CC1101_GDO0_PIN, (i % 2 == 0) ? HIGH : LOW);
+      next += timings[i];
+      while (esp_timer_get_time() < next) {
+      }
+    }
+    digitalWrite(CC1101_GDO0_PIN, LOW);
+    if (shortFrame) {
+      interrupts();
+    }
+    if (r + 1 < repeat && interFrameGapUs > 0) {
+      delayMicroseconds(interFrameGapUs % 1000);
+      delay(interFrameGapUs / 1000);
+    }
+  }
+
+  leaveRawMode(saved);
+  return true;
 }

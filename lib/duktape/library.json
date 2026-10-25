@@ -1,0 +1,10 @@
+{
+  "name": "duktape",
+  "version": "2.7.0",
+  "description": "Duktape embeddable JavaScript engine (ES5.1) with ZX-OS config patches",
+  "license": "MIT",
+  "build": {
+    "srcDir": "src",
+    "flags": ["-w"]
+  }
+}

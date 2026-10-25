@@ -22,6 +22,7 @@ enum class UiTextKey : uint8_t {
   Nfc,
   Rfid,
   Nrf24,
+  Js,
   OpenClaw,
   Language,
   English,

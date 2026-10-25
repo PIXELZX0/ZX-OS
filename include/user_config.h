@@ -77,6 +77,18 @@
 #endif
 #define USER_AUDIO_PLAYBACK_VOLUME 12
 
+// --- Infrared (-1 = not present) ---
+#ifndef HAL_PIN_IR_TX
+  #define USER_IR_TX_PIN -1
+#else
+  #define USER_IR_TX_PIN HAL_PIN_IR_TX
+#endif
+#ifndef HAL_PIN_IR_RX
+  #define USER_IR_RX_PIN -1
+#else
+  #define USER_IR_RX_PIN HAL_PIN_IR_RX
+#endif
+
 // --- External modules (override per your wiring) ---
 #ifndef HAL_I2C_SDA
   #define USER_NFC_I2C_SDA -1

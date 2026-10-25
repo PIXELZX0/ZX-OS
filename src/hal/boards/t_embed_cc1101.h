@@ -22,6 +22,7 @@
 #define HAL_HAS_MIC           1
 #define HAL_HAS_ANTENNA_SWITCH 1
 #define HAL_HAS_POWER_ENABLE  1
+#define HAL_HAS_IR            1
 
 // --- Power ---
 #define HAL_PIN_POWER_ENABLE  15
@@ -77,6 +78,12 @@
 #define HAL_PIN_I2S_BCLK      46
 #define HAL_PIN_I2S_LRCLK     40
 #define HAL_PIN_I2S_DOUT      7
+
+// --- Infrared (per LilyGO wiki: BOARD_IR_EN=2, BOARD_IR_RX=1) ---
+// NOTE: HAL_PIN_RFID_SS / HAL_PIN_RFID_RST below reuse GPIO 2 / 1. Do not wire
+// an external RC522 and use the built-in IR at the same time.
+#define HAL_PIN_IR_TX         2
+#define HAL_PIN_IR_RX         1
 
 // --- External modules (optional wiring) ---
 #define HAL_PIN_NFC_IRQ       17

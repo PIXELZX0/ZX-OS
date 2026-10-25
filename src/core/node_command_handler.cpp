@@ -5,6 +5,7 @@
 
 #include "cc1101_radio.h"
 #include "gateway_client.h"
+#include "js/js_engine.h"
 
 namespace {
 
@@ -221,7 +222,9 @@ bool isSupportedBin(const String &bin) {
          bin == "cc1101.packet_get" ||
          bin == "cc1101.packet_set" ||
          bin == "cc1101.packet_tx_text" ||
-         bin == "cc1101.packet_rx_once";
+         bin == "cc1101.packet_rx_once" ||
+         bin == "js.eval" ||
+         bin == "js.run_file";
 }
 
 void buildInfoPayload(JsonObject obj) {
@@ -266,6 +269,13 @@ void NodeCommandHandler::handleInvoke(const String &invokeId,
 
   if (command.startsWith("cc1101.")) {
     if (handleCc1101Command(invokeId, nodeId, command, params)) {
+      return;
+    }
+    return;
+  }
+
+  if (command.startsWith("js.")) {
+    if (handleJsCommand(invokeId, nodeId, command, params)) {
       return;
     }
     return;
@@ -763,5 +773,76 @@ bool NodeCommandHandler::handleCc1101Command(const String &invokeId,
                             nodeId,
                             "UNAVAILABLE",
                             "unsupported cc1101 command");
+  return true;
+}
+
+bool NodeCommandHandler::handleJsCommand(const String &invokeId,
+                                         const String &nodeId,
+                                         const String &command,
+                                         JsonObjectConst params) {
+  DynamicJsonDocument payload(2048);
+
+  if (command != "js.eval" && command != "js.run_file") {
+    gateway_->sendInvokeError(invokeId, nodeId, "UNAVAILABLE",
+                              "unsupported js command");
+    return true;
+  }
+
+  if (zxjs::isBusy()) {
+    gateway_->sendInvokeError(invokeId, nodeId, "UNAVAILABLE",
+                              "another script is already running");
+    return true;
+  }
+
+  int timeoutMs = 10000;
+  if (!params["timeoutMs"].isNull() &&
+      !readIntFromJson(params["timeoutMs"], timeoutMs)) {
+    gateway_->sendInvokeError(invokeId, nodeId, "INVALID_REQUEST",
+                              "invalid timeoutMs");
+    return true;
+  }
+  if (timeoutMs < 1 || timeoutMs > 30000) {
+    timeoutMs = 10000;
+  }
+
+  String log;
+  zxjs::Host host;
+  host.print = [&log](const String &line) {
+    if (log.length() < 4000) {
+      log += line;
+      log += '\n';
+    }
+  };
+
+  zxjs::Result result;
+  if (command == "js.eval") {
+    const String source = params["source"].as<String>();
+    if (source.isEmpty()) {
+      gateway_->sendInvokeError(invokeId, nodeId, "INVALID_REQUEST",
+                                "source is required");
+      return true;
+    }
+    result = zxjs::runSource(source, "gateway.js", host,
+                             static_cast<uint32_t>(timeoutMs));
+  } else {
+    const String path = params["path"].as<String>();
+    if (path.isEmpty()) {
+      gateway_->sendInvokeError(invokeId, nodeId, "INVALID_REQUEST",
+                                "path is required");
+      return true;
+    }
+    result = zxjs::runFile(path, host, static_cast<uint32_t>(timeoutMs));
+  }
+
+  payload["ok"] = result.ok;
+  payload["cancelled"] = result.cancelled;
+  payload["timedOut"] = result.timedOut;
+  payload["log"] = log;
+  if (result.ok) {
+    payload["value"] = result.value;
+  } else {
+    payload["error"] = result.error;
+  }
+  gateway_->sendInvokeOk(invokeId, nodeId, payload);
   return true;
 }

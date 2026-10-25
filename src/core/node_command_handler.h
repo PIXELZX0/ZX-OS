@@ -29,4 +29,9 @@ class NodeCommandHandler {
                            const String &nodeId,
                            const String &command,
                            JsonObjectConst params);
+
+  bool handleJsCommand(const String &invokeId,
+                       const String &nodeId,
+                       const String &command,
+                       JsonObjectConst params);
 };

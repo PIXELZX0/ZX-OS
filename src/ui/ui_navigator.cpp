@@ -4,6 +4,7 @@
 
 #include "../apps/app_market_app.h"
 #include "../apps/file_explorer_app.h"
+#include "../apps/js_app.h"
 #include "../apps/nfc_app.h"
 #include "../apps/rfid_app.h"
 #include "../apps/settings_app.h"
@@ -24,6 +25,7 @@ void UiNavigator::runLauncher(AppContext &ctx,
   items.push_back(uiText(lang, UiTextKey::FileExplorer));
   items.push_back(uiText(lang, UiTextKey::Nfc));
   items.push_back(uiText(lang, UiTextKey::Rfid));
+  items.push_back(uiText(lang, UiTextKey::Js));
 
   ctx.uiRuntime->setStatusLine("");
 
@@ -46,5 +48,7 @@ void UiNavigator::runLauncher(AppContext &ctx,
     runNfcApp(ctx, backgroundTick);
   } else if (choice == 4) {
     runRfidApp(ctx, backgroundTick);
+  } else if (choice == 5) {
+    runJsApp(ctx, backgroundTick);
   }
 }
