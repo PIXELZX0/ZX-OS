@@ -564,7 +564,7 @@
 
 <!-- ═══════════════════════ FOOTER ═══════════════════════ -->
 <footer>
-  <a href="https://github.com/HITEYY/ZX-OS" target="_blank" rel="noopener">HITEYY/ZX-OS</a>
+  <a id="repo-link" href="https://github.com/PIXELZX0/ZX-OS" target="_blank" rel="noopener">PIXELZX0/ZX-OS</a>
   &nbsp;·&nbsp;
   ZX-OS Web Flusher
   &nbsp;·&nbsp;
@@ -574,12 +574,20 @@
 <!-- ═══════════════════════ SCRIPT ═══════════════════════ -->
 <script type="module">
   // ── Constants ────────────────────────────────────────────────
-  const REPO       = 'HITEYY/ZX-OS';
-  const APP_OFFSET = 0x10000;          // standard Arduino ESP32 app partition
+  // When served from <owner>.github.io/<repo>/, use that repo (forks work as-is).
+  const DEFAULT_REPO = 'PIXELZX0/ZX-OS';
+  const PAGES_OWNER  = location.hostname.endsWith('.github.io') ? location.hostname.split('.')[0] : null;
+  const PAGES_NAME   = PAGES_OWNER ? location.pathname.split('/').filter(Boolean)[0] : null;
+  const REPO         = PAGES_OWNER && PAGES_NAME ? `${PAGES_OWNER}/${PAGES_NAME}` : DEFAULT_REPO;
+  const APP_OFFSET   = 0x10000;          // standard Arduino ESP32 app partition
 
   const API_RELEASES = `https://api.github.com/repos/${REPO}/releases`;
   const GH_RELEASE   = (tag) => `https://github.com/${REPO}/releases/tag/${tag}`;
-  const PAGES_BASE   = `https://hiteyy.github.io/ZX-OS`;
+  const PAGES_BASE   = `https://${REPO.split('/')[0].toLowerCase()}.github.io/${REPO.split('/')[1]}`;
+
+  const repoLink = document.getElementById('repo-link');
+  repoLink.href = `https://github.com/${REPO}`;
+  repoLink.textContent = REPO;
 
   // ── Board state ────────────────────────────────────────────────
   let currentBoard = 't-embed-cc1101';

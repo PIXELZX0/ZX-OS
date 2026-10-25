@@ -2,6 +2,7 @@
 
 // Include HAL board config first so board-specific pin defines are available.
 #include "hal/board_config.h"
+#include "firmware_build_info.h"
 
 // ============================================================================
 // ZX-OS User Configuration
@@ -24,8 +25,9 @@
 #define USER_GATEWAY_AUTH_MODE 0
 
 // --- APPMarket ---
-#define USER_APPMARKET_GITHUB_REPO "HITEYY/AI-cc1101"
-#define USER_APPMARKET_RELEASE_ASSET "openclaw-t-embed-cc1101-latest.bin"
+// Defaults follow the build: this repo's releases and this board's image.
+#define USER_APPMARKET_GITHUB_REPO ZX_FW_REPO
+#define USER_APPMARKET_RELEASE_ASSET ZX_FW_ASSET_PREFIX "latest.bin"
 
 // --- OpenClaw Node Identity ---
 // These defaults adapt to the active board via HAL_BOARD_NAME at runtime.

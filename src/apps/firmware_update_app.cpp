@@ -18,23 +18,13 @@
 
 #include "../core/board_pins.h"
 #include "../core/shared_spi_bus.h"
+#include "../core/tls_ca_bundle.h"
 #include "../ui/ui_runtime.h"
-
-// Injected by scripts/firmware_version.py; fallbacks keep ad-hoc builds compiling.
-#ifndef ZX_FW_VERSION
-#define ZX_FW_VERSION "dev"
-#endif
-#ifndef ZX_BUILD_ENV
-#define ZX_BUILD_ENV "unknown"
-#endif
-#ifndef ZX_FW_REPO
-#define ZX_FW_REPO "PIXELZX0/ZX-OS"
-#endif
+#include "firmware_build_info.h"
 
 namespace {
 
 constexpr const char *kFirmwareRepoSlug = ZX_FW_REPO;
-constexpr const char *kAssetPrefix = "openclaw-";
 constexpr const char *kUserAgent = "ZX-OS-FirmwareUpdate";
 constexpr const char *kFirmwareDir = "/firmware";
 constexpr const char *kLatestFirmwarePath = "/firmware/latest.bin";
@@ -375,8 +365,6 @@ bool writeSmallSdFile(const char *path, const String &value) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-// TLS certificates are not validated (no CA bundle is embedded); integrity of the
-// firmware image is instead enforced by the SHA-256 published with each release.
 bool beginHttps(HTTPClient &http,
                 WiFiClientSecure &client,
                 const String &url,
@@ -388,7 +376,7 @@ bool beginHttps(HTTPClient &http,
     return false;
   }
 
-  client.setInsecure();
+  tlsca::attach(client);
   if (!http.begin(client, url)) {
     if (error) {
       *error = "HTTP begin failed";
@@ -654,7 +642,7 @@ bool selectBoardAsset(JsonObjectConst release, ReleaseInfo &infoOut, String *err
   }
   infoOut.prerelease = release["prerelease"] | false;
 
-  const String base = String(kAssetPrefix) + buildEnvName() + "-";
+  const String base = ZX_FW_ASSET_PREFIX;
   const String versionedName = base + infoOut.tag + ".bin";
   const String aliasName = base + "latest.bin";
 

@@ -18,14 +18,16 @@
 #include "../core/board_pins.h"
 #include "../core/runtime_config.h"
 #include "../core/shared_spi_bus.h"
+#include "../core/tls_ca_bundle.h"
 #include "../ui/ui_runtime.h"
+#include "firmware_build_info.h"
 
 namespace {
 
 constexpr const char *kAppMarketDir = "/appmarket";
 constexpr const char *kLatestPackagePath = "/appmarket/latest.bin";
 constexpr const char *kBackupPackagePath = "/appmarket/current_backup.bin";
-constexpr const char *kPinnedRepoSlug = "HITEYY/AI-cc1101";
+constexpr const char *kPinnedRepoSlug = ZX_FW_REPO;
 constexpr size_t kTransferChunkBytes = 2048;
 constexpr unsigned long kDownloadIdleTimeoutMs = 12000UL;
 
@@ -131,6 +133,16 @@ bool hasBinExtension(const String &pathOrNameRaw) {
   String pathOrName = pathOrNameRaw;
   pathOrName.toLowerCase();
   return pathOrName.endsWith(".bin");
+}
+
+// Firmware images for other boards share a release; never auto-pick them.
+bool isOtherBoardFirmware(const String &name) {
+  return name.startsWith("openclaw-") && hasBinExtension(name) &&
+         !name.startsWith(ZX_FW_ASSET_PREFIX);
+}
+
+bool isThisBoardFirmware(const String &name) {
+  return name.startsWith(ZX_FW_ASSET_PREFIX) && hasBinExtension(name);
 }
 
 String baseName(const String &path) {
@@ -276,10 +288,9 @@ String normalizeRepoSlug(const String &rawInput) {
 bool resolveRepoSlug(const RuntimeConfig &config,
                      String &repoOut,
                      String *error) {
-  String repo = normalizeRepoSlug(config.appMarketGithubRepo);
-  if (repo.isEmpty()) {
-    repo = kPinnedRepoSlug;
-  }
+  (void)config;
+  // The repository is pinned per build; ignore stale values saved by older firmware.
+  const String repo = normalizeRepoSlug(kPinnedRepoSlug);
 
   const int slash = repo.indexOf('/');
   if (slash <= 0 || slash >= static_cast<int>(repo.length()) - 1) {
@@ -308,7 +319,7 @@ bool httpGetSecure(const String &url,
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
+  tlsca::attach(client);
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -385,7 +396,7 @@ bool parseLatestReleaseBody(const String &body,
   const String preferredAssetName = preferredAssetNameRaw;
   JsonObjectConst selected;
 
-  if (!preferredAssetName.isEmpty()) {
+  if (!preferredAssetName.isEmpty() && !isOtherBoardFirmware(preferredAssetName)) {
     for (JsonObjectConst asset : assets) {
       const String name = String(static_cast<const char *>(asset["name"] | ""));
       if (name == preferredAssetName) {
@@ -398,7 +409,7 @@ bool parseLatestReleaseBody(const String &body,
   if (selected.isNull()) {
     for (JsonObjectConst asset : assets) {
       const String name = String(static_cast<const char *>(asset["name"] | ""));
-      if (hasBinExtension(name)) {
+      if (isThisBoardFirmware(name)) {
         selected = asset;
         break;
       }
@@ -406,7 +417,10 @@ bool parseLatestReleaseBody(const String &body,
   }
 
   if (selected.isNull()) {
-    selected = assets[0];
+    if (error) {
+      *error = "No " ZX_BUILD_ENV " firmware in release";
+    }
+    return false;
   }
 
   infoOut.assetName = String(static_cast<const char *>(selected["name"] | ""));
@@ -557,7 +571,7 @@ int preferredAssetIndex(const ReleaseBrowseEntry &release,
                         const String &preferredAssetNameRaw) {
   String preferredAssetName = preferredAssetNameRaw;
   preferredAssetName.trim();
-  if (!preferredAssetName.isEmpty()) {
+  if (!preferredAssetName.isEmpty() && !isOtherBoardFirmware(preferredAssetName)) {
     for (size_t i = 0; i < release.assets.size(); ++i) {
       if (release.assets[i].name == preferredAssetName) {
         return static_cast<int>(i);
@@ -565,7 +579,7 @@ int preferredAssetIndex(const ReleaseBrowseEntry &release,
     }
   }
   for (size_t i = 0; i < release.assets.size(); ++i) {
-    if (hasBinExtension(release.assets[i].name)) {
+    if (isThisBoardFirmware(release.assets[i].name)) {
       return static_cast<int>(i);
     }
   }
@@ -677,7 +691,7 @@ bool downloadUrlToSdFile(const String &url,
   }
 
   WiFiClientSecure client;
-  client.setInsecure();
+  tlsca::attach(client);
 
   HTTPClient http;
   if (!http.begin(client, url)) {

@@ -20,7 +20,7 @@ It combines a launcher-based LVGL UI with wireless tooling, OpenClaw gateway int
 
 브라우저에서 바로 릴리즈된 ZX-OS 펌웨어를 장치에 플래시할 수 있습니다.
 
-**→ https://hiteyy.github.io/ZX-OS/**
+**→ https://pixelzx0.github.io/ZX-OS/**
 
 - **요구사항**: Chrome / Edge (데스크톱) — Web Serial API 지원 브라우저
 - 별도 설치 없이 GitHub 릴리즈 목록에서 버전을 선택하고 USB로 연결된 장치에 바로 플래시합니다.

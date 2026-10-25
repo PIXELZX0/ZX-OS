@@ -7,6 +7,12 @@
 #define LV_DEF_REFR_PERIOD 33
 #define LV_DPI_DEF 130
 
+/* Classic ESP32 (CYD, no PSRAM) cannot fit LVGL's 64 KB built-in pool in
+ * static DRAM; allocate LVGL objects from the regular heap instead. */
+#if defined(BOARD_CYD_2432S028)
+#define LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB
+#endif
+
 /* Fonts */
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
