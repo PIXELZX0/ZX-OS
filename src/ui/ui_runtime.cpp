@@ -14,7 +14,8 @@
 #include <sys/time.h>
 
 #include "../core/board_pins.h"
-#include "fonts/lv_font_korean_ui_14.h"
+#include "sd_font.h"
+#include "../core/runtime_config.h"
 #include "input_adapter.h"
 #include "launcher_icons.h"
 #include "lvgl_port.h"
@@ -356,6 +357,7 @@ class UiRuntime::Impl {
   String statusLine;
   UiLanguage language = UiLanguage::English;
   bool koreanFontInstalled = false;
+  const lv_font_t *koreanFont = nullptr;
   String timezoneTz = USER_TIMEZONE_TZ;
   String timezonePosixTz = USER_TIMEZONE_TZ;
 
@@ -429,8 +431,8 @@ class UiRuntime::Impl {
   }
 
   const lv_font_t *font() const {
-    if (koreanFontInstalled) {
-      return &lv_font_korean_ui_14;
+    if (koreanFontInstalled && koreanFont) {
+      return koreanFont;
     }
     return &lv_font_montserrat_14;
   }
@@ -2251,11 +2253,31 @@ UiLanguage UiRuntime::language() const {
   return impl_->language;
 }
 
-void UiRuntime::setKoreanFontInstalled(bool installed) {
+bool UiRuntime::setKoreanFontInstalled(bool installed, String *error) {
+  if (installed) {
+    String err;
+    const lv_font_t *font = nullptr;
+    if (mountSdCard(&err)) {
+      font = sdfont::open(sdfont::kKoreanFontPath, &lv_font_montserrat_14, &err);
+    }
+    if (font) {
+      impl_->koreanFont = font;
+    } else {
+      installed = false;
+      Serial.printf("[ui] Korean font unavailable: %s\n", err.c_str());
+      if (error) {
+        *error = err;
+      }
+    }
+  } else {
+    sdfont::close();
+  }
+
   impl_->koreanFontInstalled = installed;
   if (impl_->port.ready()) {
     impl_->applyTheme();
   }
+  return installed;
 }
 
 bool UiRuntime::isKoreanFontInstalled() const {

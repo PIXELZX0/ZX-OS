@@ -55,4 +55,7 @@ bool resetConfig(String *error = nullptr);
 
 bool isKoreanFontInstalled(const RuntimeConfig &config);
 
+// Mounts the SD card on the shared SPI bus (no-op when already mounted).
+bool mountSdCard(String *error = nullptr);
+
 const char *gatewayAuthModeName(GatewayAuthMode mode);

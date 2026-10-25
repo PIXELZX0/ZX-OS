@@ -1,6 +1,8 @@
 #include "settings_app.h"
 #include "firmware_update_app.h"
 
+#include <SD.h>
+
 #include <vector>
 
 #include "../core/ble_manager.h"
@@ -8,6 +10,7 @@
 #include "../core/runtime_config.h"
 #include "../core/wifi_manager.h"
 #include "../ui/i18n.h"
+#include "../ui/sd_font.h"
 #include "../ui/ui_runtime.h"
 
 namespace {
@@ -239,6 +242,28 @@ String fontPackStatusLabel(bool installed, UiLanguage lang) {
   return String(uiText(lang, UiTextKey::KoreanFontPack)) + ": " + status;
 }
 
+// Uses a pack already copied to SD, otherwise downloads it from the latest
+// release, then activates it.
+bool installKoreanFont(AppContext &ctx, const std::function<void()> &backgroundTick) {
+  String err;
+  if (!mountSdCard(&err)) {
+    ctx.uiRuntime->showToast("System", err, 1800, backgroundTick);
+    return false;
+  }
+
+  // A pack copied to SD by hand is used as-is; if it does not open, fall
+  // through and replace it with the release download.
+  if (SD.exists(sdfont::kKoreanFontPath) && ctx.uiRuntime->setKoreanFontInstalled(true)) {
+    return true;
+  }
+  if (!installKoreanFontPack(ctx, backgroundTick, &err) ||
+      !ctx.uiRuntime->setKoreanFontInstalled(true, &err)) {
+    ctx.uiRuntime->showToast("System", err, 2200, backgroundTick);
+    return false;
+  }
+  return true;
+}
+
 void runFontPacksMenu(AppContext &ctx,
                       const std::function<void()> &backgroundTick) {
   const UiLanguage lang = ctx.uiRuntime->language();
@@ -246,7 +271,7 @@ void runFontPacksMenu(AppContext &ctx,
 
   while (true) {
     std::vector<String> menu;
-    const bool installed = ctx.config.koreanFontInstalled;
+    const bool installed = ctx.uiRuntime->isKoreanFontInstalled();
 
     String actionLabel = installed
                              ? String(uiText(lang, UiTextKey::Uninstall))
@@ -270,8 +295,14 @@ void runFontPacksMenu(AppContext &ctx,
     selected = choice;
 
     if (choice == 0) {
+      if (!installed && !installKoreanFont(ctx, backgroundTick)) {
+        continue;
+      }
+      if (installed) {
+        ctx.uiRuntime->setKoreanFontInstalled(false);
+        SD.remove(sdfont::kKoreanFontPath);
+      }
       ctx.config.koreanFontInstalled = !installed;
-      ctx.uiRuntime->setKoreanFontInstalled(ctx.config.koreanFontInstalled);
       markDirty(ctx);
 
       if (!ctx.config.koreanFontInstalled &&
@@ -299,7 +330,7 @@ void runLanguageAndFontMenu(AppContext &ctx,
     std::vector<String> menu;
     menu.push_back(String(uiText(currentLang, UiTextKey::Language)) +
                    ": " + uiLanguageLabel(currentLang));
-    menu.push_back(fontPackStatusLabel(ctx.config.koreanFontInstalled, currentLang));
+    menu.push_back(fontPackStatusLabel(ctx.uiRuntime->isKoreanFontInstalled(), currentLang));
     menu.push_back("Back");
 
     const int choice = ctx.uiRuntime->menuLoop(
@@ -330,7 +361,7 @@ void runLanguageAndFontMenu(AppContext &ctx,
       if (langIndex >= 0 && langIndex <= 1) {
         const UiLanguage nextLang = langIndex == 1 ? UiLanguage::Korean
                                                    : UiLanguage::English;
-        if (nextLang == UiLanguage::Korean && !ctx.config.koreanFontInstalled) {
+        if (nextLang == UiLanguage::Korean && !ctx.uiRuntime->isKoreanFontInstalled()) {
           ctx.uiRuntime->showToast(
               "System",
               uiText(currentLang, UiTextKey::FontRequiredForKorean),

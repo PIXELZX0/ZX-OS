@@ -41,7 +41,9 @@ class UiRuntime {
   void setLanguage(UiLanguage language);
   UiLanguage language() const;
 
-  void setKoreanFontInstalled(bool installed);
+  // Loads (or unloads) the Korean font pack from SD. Returns whether the
+  // font is now active; on failure the UI keeps using the built-in font.
+  bool setKoreanFontInstalled(bool installed, String *error = nullptr);
   bool isKoreanFontInstalled() const;
 
   void setTimezone(const String &tz);

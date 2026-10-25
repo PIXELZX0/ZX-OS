@@ -19,6 +19,7 @@
 #include "../core/board_pins.h"
 #include "../core/shared_spi_bus.h"
 #include "../core/tls_ca_bundle.h"
+#include "../ui/sd_font.h"
 #include "../ui/ui_runtime.h"
 #include "firmware_build_info.h"
 
@@ -292,8 +293,8 @@ bool ensureSdMounted(bool forceMount, String *error) {
 #endif
 }
 
-bool ensureFirmwareDirectory(String *error) {
-  File node = SD.open(kFirmwareDir, FILE_READ);
+bool ensureSdDirectory(const char *dir, String *error) {
+  File node = SD.open(dir, FILE_READ);
   if (node) {
     const bool isDir = node.isDirectory();
     node.close();
@@ -301,14 +302,14 @@ bool ensureFirmwareDirectory(String *error) {
       return true;
     }
     if (error) {
-      *error = "Path conflict: /firmware is file";
+      *error = String("Path conflict: ") + dir + " is file";
     }
     return false;
   }
 
-  if (!SD.mkdir(kFirmwareDir)) {
+  if (!SD.mkdir(dir)) {
     if (error) {
-      *error = "Failed to create /firmware";
+      *error = String("Failed to create ") + dir;
     }
     return false;
   }
@@ -628,9 +629,21 @@ void buildReleaseFilter(JsonObject release) {
   asset["size"] = true;
 }
 
-// Picks this board's firmware ("openclaw-<env>-<tag>.bin", else the
-// "-latest.bin" alias) and its ".sha256" sidecar from a release.
-bool selectBoardAsset(JsonObjectConst release, ReleaseInfo &infoOut, String *error) {
+using AssetNamesFn = std::function<std::vector<String>(const String &tag)>;
+
+// This board's firmware: "openclaw-<env>-<tag>.bin", else the "-latest.bin" alias.
+std::vector<String> boardFirmwareNames(const String &tag) {
+  const String base = ZX_FW_ASSET_PREFIX;
+  return {base + tag + ".bin", base + "latest.bin"};
+}
+
+// Picks the first asset named by `namesFor` (in preference order) that the
+// release carries, along with its ".sha256" sidecar.
+bool selectAsset(JsonObjectConst release,
+                 const AssetNamesFn &namesFor,
+                 const String &what,
+                 ReleaseInfo &infoOut,
+                 String *error) {
   if (release["draft"] | false) {
     return false;
   }
@@ -642,52 +655,45 @@ bool selectBoardAsset(JsonObjectConst release, ReleaseInfo &infoOut, String *err
   }
   infoOut.prerelease = release["prerelease"] | false;
 
-  const String base = ZX_FW_ASSET_PREFIX;
-  const String versionedName = base + infoOut.tag + ".bin";
-  const String aliasName = base + "latest.bin";
-
-  JsonObjectConst versioned;
-  JsonObjectConst alias;
-  String versionedSha;
-  String aliasSha;
-  for (JsonObjectConst asset : release["assets"].as<JsonArrayConst>()) {
-    const String name = String(static_cast<const char *>(asset["name"] | ""));
-    const String url = String(static_cast<const char *>(asset["browser_download_url"] | ""));
-    if (name == versionedName) {
-      versioned = asset;
-    } else if (name == aliasName) {
-      alias = asset;
-    } else if (name == versionedName + ".sha256") {
-      versionedSha = url;
-    } else if (name == aliasName + ".sha256") {
-      aliasSha = url;
+  const JsonArrayConst assets = release["assets"].as<JsonArrayConst>();
+  for (const String &wanted : namesFor(infoOut.tag)) {
+    JsonObjectConst match;
+    String shaUrl;
+    for (JsonObjectConst asset : assets) {
+      const String name = String(static_cast<const char *>(asset["name"] | ""));
+      if (name == wanted) {
+        match = asset;
+      } else if (name == wanted + ".sha256") {
+        shaUrl = String(static_cast<const char *>(asset["browser_download_url"] | ""));
+      }
     }
+    if (match.isNull()) {
+      continue;
+    }
+
+    infoOut.assetName = wanted;
+    infoOut.downloadUrl = String(static_cast<const char *>(match["browser_download_url"] | ""));
+    infoOut.size = match["size"] | 0;
+    infoOut.sha256Url = shaUrl;
+    if (infoOut.downloadUrl.isEmpty()) {
+      if (error) {
+        *error = "Release asset URL missing";
+      }
+      return false;
+    }
+    return true;
   }
 
-  const bool useVersioned = !versioned.isNull();
-  const JsonObjectConst selected = useVersioned ? versioned : alias;
-  if (selected.isNull()) {
-    if (error) {
-      *error = "No " + buildEnvName() + " firmware in " +
-               (infoOut.tag.isEmpty() ? String("release") : infoOut.tag);
-    }
-    return false;
+  if (error) {
+    *error = "No " + what + " in " + (infoOut.tag.isEmpty() ? String("release") : infoOut.tag);
   }
-
-  infoOut.assetName = String(static_cast<const char *>(selected["name"] | ""));
-  infoOut.downloadUrl = String(static_cast<const char *>(selected["browser_download_url"] | ""));
-  infoOut.size = selected["size"] | 0;
-  infoOut.sha256Url = useVersioned ? versionedSha : aliasSha;
-  if (infoOut.downloadUrl.isEmpty()) {
-    if (error) {
-      *error = "Release asset URL missing";
-    }
-    return false;
-  }
-  return true;
+  return false;
 }
 
-bool fetchLatestReleaseInfo(ReleaseInfo &infoOut, String *error) {
+bool fetchLatestReleaseInfo(const AssetNamesFn &namesFor,
+                            const String &what,
+                            ReleaseInfo &infoOut,
+                            String *error) {
   const String apiBase = "https://api.github.com/repos/" + String(kFirmwareRepoSlug);
 
   {
@@ -697,7 +703,7 @@ bool fetchLatestReleaseInfo(ReleaseInfo &infoOut, String *error) {
     int code = -1;
     String latestErr;
     if (httpGetJson(apiBase + "/releases/latest", filter, doc, code, &latestErr)) {
-      return selectBoardAsset(doc.as<JsonObjectConst>(), infoOut, error);
+      return selectAsset(doc.as<JsonObjectConst>(), namesFor, what, infoOut, error);
     }
     // 404 just means there is no stable release yet; try pre-releases below.
     if (code != HTTP_CODE_NOT_FOUND) {
@@ -723,7 +729,7 @@ bool fetchLatestReleaseInfo(ReleaseInfo &infoOut, String *error) {
   String firstErr;
   for (JsonObjectConst release : doc.as<JsonArrayConst>()) {
     String err;
-    if (selectBoardAsset(release, infoOut, &err)) {
+    if (selectAsset(release, namesFor, what, infoOut, &err)) {
       return true;
     }
     if (firstErr.isEmpty()) {
@@ -855,21 +861,26 @@ bool flashFromUrl(const ReleaseInfo &info,
   return finishFlash(expectedSha, hasher, error);
 }
 
-bool downloadToSd(const ReleaseInfo &info,
-                  const String &expectedSha,
-                  const std::function<void()> &backgroundTick,
-                  const ProgressFn &progressTick,
-                  uint32_t *bytesOut,
-                  String *error) {
+// Downloads into `<destPath>.tmp` and only replaces `destPath` once the
+// SHA-256 matches. `actualShaOut` receives the hash of what was written.
+bool downloadToSdFile(const ReleaseInfo &info,
+                      const String &expectedSha,
+                      const char *dir,
+                      const char *destPath,
+                      const std::function<void()> &backgroundTick,
+                      const ProgressFn &progressTick,
+                      uint32_t *bytesOut,
+                      String *actualShaOut,
+                      String *error) {
   String sdErr;
-  if (!ensureSdMounted(false, &sdErr) || !ensureFirmwareDirectory(&sdErr)) {
+  if (!ensureSdMounted(false, &sdErr) || !ensureSdDirectory(dir, &sdErr)) {
     if (error) {
       *error = sdErr;
     }
     return false;
   }
 
-  const String tempPath = String(kLatestFirmwarePath) + ".tmp";
+  const String tempPath = String(destPath) + ".tmp";
   if (SD.exists(tempPath.c_str())) {
     SD.remove(tempPath.c_str());
   }
@@ -911,14 +922,39 @@ bool downloadToSd(const ReleaseInfo &info,
     return false;
   }
 
-  if (SD.exists(kLatestFirmwarePath)) {
-    SD.remove(kLatestFirmwarePath);
+  if (SD.exists(destPath)) {
+    SD.remove(destPath);
   }
-  if (!SD.rename(tempPath.c_str(), kLatestFirmwarePath)) {
+  if (!SD.rename(tempPath.c_str(), destPath)) {
     SD.remove(tempPath.c_str());
     if (error) {
       *error = "SD rename failed";
     }
+    return false;
+  }
+
+  if (actualShaOut) {
+    *actualShaOut = actualSha;
+  }
+  return true;
+}
+
+bool downloadFirmwareToSd(const ReleaseInfo &info,
+                          const String &expectedSha,
+                          const std::function<void()> &backgroundTick,
+                          const ProgressFn &progressTick,
+                          uint32_t *bytesOut,
+                          String *error) {
+  String actualSha;
+  if (!downloadToSdFile(info,
+                        expectedSha,
+                        kFirmwareDir,
+                        kLatestFirmwarePath,
+                        backgroundTick,
+                        progressTick,
+                        bytesOut,
+                        &actualSha,
+                        error)) {
     return false;
   }
 
@@ -1048,7 +1084,10 @@ bool checkLatest(AppContext &ctx,
   bool ok = false;
   {
     OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Checking GitHub releases...", -1);
-    ok = fetchLatestReleaseInfo(session.latest, &err);
+    ok = fetchLatestReleaseInfo(boardFirmwareNames,
+                                buildEnvName() + " firmware",
+                                session.latest,
+                                &err);
   }
   session.haveLatest = ok;
   if (!ok) {
@@ -1163,16 +1202,16 @@ void downloadPackageToSd(AppContext &ctx,
   bool ok = fetchExpectedSha256(info, expectedSha, &err);
   if (ok) {
     OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Preparing download...", -1);
-    ok = downloadToSd(info,
-                      expectedSha,
-                      backgroundTick,
-                      [&](uint32_t written, uint32_t total) {
-                        overlay.update("Firmware Update",
-                                       progressText("Downloading", written, total),
-                                       percentOf(written, total));
-                      },
-                      &downloaded,
-                      &err);
+    ok = downloadFirmwareToSd(info,
+                              expectedSha,
+                              backgroundTick,
+                              [&](uint32_t written, uint32_t total) {
+                                overlay.update("Firmware Update",
+                                               progressText("Downloading", written, total),
+                                               percentOf(written, total));
+                              },
+                              &downloaded,
+                              &err);
   }
   if (!ok) {
     session.lastAction = "Download failed: " + err;
@@ -1253,6 +1292,39 @@ void showLatest(AppContext &ctx,
 }
 
 }  // namespace
+
+bool installKoreanFontPack(AppContext &ctx,
+                           const std::function<void()> &backgroundTick,
+                           String *error) {
+  ReleaseInfo info;
+  String expectedSha;
+  {
+    OverlayScope overlay(ctx.uiRuntime, "Font Pack", "Checking GitHub releases...", -1);
+    if (!fetchLatestReleaseInfo(
+            [](const String &) { return std::vector<String>{sdfont::kKoreanFontReleaseAsset}; },
+            "Korean font pack",
+            info,
+            error) ||
+        !fetchExpectedSha256(info, expectedSha, error)) {
+      return false;
+    }
+  }
+
+  OverlayScope overlay(ctx.uiRuntime, "Font Pack", "Downloading...", 0);
+  return downloadToSdFile(info,
+                          expectedSha,
+                          sdfont::kFontDir,
+                          sdfont::kKoreanFontPath,
+                          backgroundTick,
+                          [&](uint32_t written, uint32_t total) {
+                            overlay.update("Font Pack",
+                                           progressText("Downloading", written, total),
+                                           percentOf(written, total));
+                          },
+                          nullptr,
+                          nullptr,
+                          error);
+}
 
 void runFirmwareUpdateApp(AppContext &ctx,
                           const std::function<void()> &backgroundTick) {

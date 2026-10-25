@@ -367,8 +367,14 @@ void setup() {
                 gAppContext.config.uiLanguage.c_str(),
                 gAppContext.config.koreanFontInstalled ? 1 : 0);
 #if HAL_HAS_DISPLAY
-  gUiRuntime.setKoreanFontInstalled(gAppContext.config.koreanFontInstalled);
-  gUiRuntime.setLanguage(uiLanguageFromConfigCode(gAppContext.config.uiLanguage));
+  const bool koreanFontReady =
+      gUiRuntime.setKoreanFontInstalled(gAppContext.config.koreanFontInstalled);
+  UiLanguage bootLanguage = uiLanguageFromConfigCode(gAppContext.config.uiLanguage);
+  if (bootLanguage == UiLanguage::Korean && !koreanFontReady) {
+    // Font pack missing from SD: fall back to English for this session only.
+    bootLanguage = UiLanguage::English;
+  }
+  gUiRuntime.setLanguage(bootLanguage);
   gUiRuntime.setTimezone(gAppContext.config.timezoneTz);
   gUiRuntime.setDisplayBrightnessPercent(gAppContext.config.displayBrightnessPercent);
 #endif

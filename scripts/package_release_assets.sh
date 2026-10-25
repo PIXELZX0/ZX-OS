@@ -9,6 +9,7 @@ FIRMWARE_BIN_PATH="${FIRMWARE_BIN_PATH:-.pio/build/${PIO_ENV}/firmware.bin}"
 REPO_SLUG="${REPO_SLUG:-${GITHUB_REPOSITORY:-unknown/unknown}}"
 INCLUDE_LATEST_ALIAS="${INCLUDE_LATEST_ALIAS:-false}"
 INCLUDE_APP_BUNDLE="${INCLUDE_APP_BUNDLE:-true}"
+INCLUDE_FONT_PACKS="${INCLUDE_FONT_PACKS:-true}"
 
 sha256_file() {
   local target="$1"
@@ -85,6 +86,13 @@ EOF
   mv "${APP_TMP_DIR}/${APP_BUNDLE}" "${APP_BUNDLE_PATH}"
   rm -rf "${APP_TMP_DIR}"
   sha256_file "${APP_BUNDLE_PATH}" > "${APP_BUNDLE_PATH}.sha256"
+fi
+
+if [[ "${INCLUDE_FONT_PACKS}" == "true" ]]; then
+  # Board-independent SD font packs, installed on device from the latest release.
+  FONT_PACK_PATH="${DIST_DIR}/zx-font-korean-ui-14.zxf"
+  cp assets/fonts/korean_ui_14.zxf "${FONT_PACK_PATH}"
+  sha256_file "${FONT_PACK_PATH}" > "${FONT_PACK_PATH}.sha256"
 fi
 
 echo "Packaged assets in ${DIST_DIR}:"

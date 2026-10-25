@@ -78,6 +78,12 @@ Settings is split into four major sections.
 
 - Edit device name (with validation).
 - Switch UI language (English/Korean).
+- Install/remove the Korean font pack. The font is not built into the firmware:
+  it lives on the SD card at `/fonts/korean_ui_14.zxf` and is read glyph by
+  glyph at runtime. Install downloads `zx-font-korean-ui-14.zxf` from the latest
+  release (SHA-256 verified), or uses a copy already placed on the SD card.
+  The pack is generated from an `lv_font_conv` C font with
+  `scripts/lvgl_font_to_zxf.py`; the committed source is `assets/fonts/`.
 - Adjust display brightness percentage.
 - Set timezone string manually.
 - Sync timezone by network/IP (requires Wi-Fi).

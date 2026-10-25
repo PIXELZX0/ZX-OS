@@ -943,6 +943,10 @@ bool isKoreanFontInstalled(const RuntimeConfig &config) {
   return config.koreanFontInstalled;
 }
 
+bool mountSdCard(String *error) {
+  return mountSd(error);
+}
+
 const char *gatewayAuthModeName(GatewayAuthMode mode) {
   return mode == GatewayAuthMode::Password ? "Password" : "Token";
 }
