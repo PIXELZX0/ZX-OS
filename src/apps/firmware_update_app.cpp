@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <SD.h>
+#include <SHA256.h>
 #include <SPI.h>
 #include <Update.h>
 #include <WiFi.h>
@@ -15,10 +16,11 @@
 #include "../core/board_pins.h"
 #include "../core/shared_spi_bus.h"
 #include "../ui/ui_runtime.h"
+#include "version.h"
 
 namespace {
 
-constexpr const char *kFirmwareRepoSlug = "HITEYY/AI-cc1101";
+constexpr const char *kDefaultFirmwareRepoSlug = "HITEYY/AI-cc1101";
 constexpr const char *kFirmwareDir = "/firmware";
 constexpr const char *kLatestFirmwarePath = "/firmware/latest.bin";
 constexpr size_t kTransferChunkBytes = 2048;
@@ -29,7 +31,14 @@ struct ReleaseInfo {
   String assetName;
   String downloadUrl;
   uint32_t size = 0;
+  String expectedSha256;  // lowercase hex, empty if not published
 };
+
+// Resolved once per app entry from runtime config so the fetch/parse helpers
+// (which have no AppContext) can see the active repo and the board-matched
+// asset preference.
+String gRepoSlug = kDefaultFirmwareRepoSlug;
+String gPreferredAsset;
 
 bool gSdMountedForFirmware = false;
 
@@ -107,6 +116,69 @@ bool hasBinExtension(const String &pathOrNameRaw) {
   String pathOrName = pathOrNameRaw;
   pathOrName.toLowerCase();
   return pathOrName.endsWith(".bin");
+}
+
+// The release workflow embeds per-asset checksums in the release body as
+// hidden markers: <!-- SHA256:<asset-name>=<hex> -->. Extract the hash that
+// matches the asset we are about to download, if present.
+String extractSha256FromBody(const String &body, const String &assetName) {
+  if (body.isEmpty() || assetName.isEmpty()) {
+    return "";
+  }
+  const String marker = "SHA256:" + assetName + "=";
+  int at = body.indexOf(marker);
+  if (at < 0) {
+    return "";
+  }
+  at += marker.length();
+  String hash;
+  for (int i = at; i < static_cast<int>(body.length()); ++i) {
+    const char c = body[i];
+    const bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                       (c >= 'A' && c <= 'F');
+    if (!isHex) {
+      break;
+    }
+    hash += c;
+  }
+  hash.toLowerCase();
+  return hash.length() == 64 ? hash : String("");
+}
+
+// Compute the SHA-256 of a file already written to the SD card, returned as
+// lowercase hex. Uses the same rweather/Crypto SHA256 primitive as the rest of
+// the firmware.
+String sha256OfSdFile(const char *path) {
+  File file = SD.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) {
+      file.close();
+    }
+    return "";
+  }
+
+  SHA256 hash;
+  uint8_t digest[SHA256::HASH_SIZE] = {0};
+  uint8_t buffer[1024] = {0};
+  hash.reset();
+  while (file.available()) {
+    const size_t readLen = file.read(buffer, sizeof(buffer));
+    if (readLen == 0) {
+      break;
+    }
+    hash.update(buffer, readLen);
+  }
+  file.close();
+  hash.finalize(digest, sizeof(digest));
+
+  static const char kHex[] = "0123456789abcdef";
+  char out[(SHA256::HASH_SIZE * 2) + 1] = {0};
+  for (size_t i = 0; i < sizeof(digest); ++i) {
+    out[i * 2] = kHex[(digest[i] >> 4) & 0x0F];
+    out[(i * 2) + 1] = kHex[digest[i] & 0x0F];
+  }
+  out[sizeof(out) - 1] = '\0';
+  return String(out);
 }
 
 bool ensureSdMounted(bool forceMount, String *error) {
@@ -316,6 +388,8 @@ bool parseLatestReleaseBody(const String &body,
   infoOut.downloadUrl =
       String(static_cast<const char *>(selected["browser_download_url"] | ""));
   infoOut.size = selected["size"] | 0;
+  infoOut.expectedSha256 = extractSha256FromBody(
+      String(static_cast<const char *>(root["body"] | "")), infoOut.assetName);
 
   if (infoOut.assetName.isEmpty() || infoOut.downloadUrl.isEmpty()) {
     if (error) {
@@ -353,11 +427,23 @@ bool parseReleaseCatalogBody(const String &body,
     }
 
     JsonObjectConst selected;
-    for (JsonObjectConst asset : assets) {
-      const String name = String(static_cast<const char *>(asset["name"] | ""));
-      if (hasBinExtension(name)) {
-        selected = asset;
-        break;
+    // Prefer the board-matched asset when the release carries it.
+    if (!gPreferredAsset.isEmpty()) {
+      for (JsonObjectConst asset : assets) {
+        const String name = String(static_cast<const char *>(asset["name"] | ""));
+        if (name == gPreferredAsset) {
+          selected = asset;
+          break;
+        }
+      }
+    }
+    if (selected.isNull()) {
+      for (JsonObjectConst asset : assets) {
+        const String name = String(static_cast<const char *>(asset["name"] | ""));
+        if (hasBinExtension(name)) {
+          selected = asset;
+          break;
+        }
       }
     }
     if (selected.isNull()) {
@@ -376,6 +462,8 @@ bool parseReleaseCatalogBody(const String &body,
     infoOut.downloadUrl =
         String(static_cast<const char *>(selected["browser_download_url"] | ""));
     infoOut.size = selected["size"] | 0;
+    infoOut.expectedSha256 = extractSha256FromBody(
+        String(static_cast<const char *>(root["body"] | "")), infoOut.assetName);
 
     if (!infoOut.assetName.isEmpty() && !infoOut.downloadUrl.isEmpty()) {
       return true;
@@ -390,16 +478,16 @@ bool parseReleaseCatalogBody(const String &body,
 
 bool fetchLatestReleaseInfo(ReleaseInfo &infoOut,
                             String *error) {
-  const String latestUrl = "https://api.github.com/repos/" + String(kFirmwareRepoSlug) +
+  const String latestUrl = "https://api.github.com/repos/" + gRepoSlug +
                            "/releases/latest";
   String latestBody;
   int latestCode = -1;
   String latestErr;
   if (httpGetSecure(latestUrl, latestBody, latestCode, &latestErr)) {
-    return parseLatestReleaseBody(latestBody, "", infoOut, error);
+    return parseLatestReleaseBody(latestBody, gPreferredAsset, infoOut, error);
   }
 
-  const String listUrl = "https://api.github.com/repos/" + String(kFirmwareRepoSlug) +
+  const String listUrl = "https://api.github.com/repos/" + gRepoSlug +
                          "/releases?per_page=8";
   String listBody;
   int listCode = -1;
@@ -711,8 +799,9 @@ void showStatus(AppContext &ctx,
 
   std::vector<String> lines;
   lines.push_back("Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
-  lines.push_back("Repo: " + String(kFirmwareRepoSlug));
-  lines.push_back("Asset: (auto .bin)");
+  lines.push_back("Current: " + String(ZX_OS_VERSION));
+  lines.push_back("Repo: " + gRepoSlug);
+  lines.push_back("Asset: " + (gPreferredAsset.isEmpty() ? String("(auto .bin)") : gPreferredAsset));
   lines.push_back("Latest tag: " + (lastTag.isEmpty() ? String("-") : lastTag));
   lines.push_back("Latest asset: " + (lastAsset.isEmpty() ? String("-") : lastAsset));
   lines.push_back("Downloaded: " +
@@ -735,8 +824,9 @@ bool downloadLatest(AppContext &ctx,
   }
 
   downloadedBytesOut = 0;
-  OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Preparing download...", -1);
-  return downloadUrlToSdFile(infoOut.downloadUrl,
+  {
+    OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Preparing download...", -1);
+    if (!downloadUrlToSdFile(infoOut.downloadUrl,
                              kLatestFirmwarePath,
                              backgroundTick,
                              [&](uint32_t written, int total) {
@@ -750,7 +840,36 @@ bool downloadLatest(AppContext &ctx,
                                overlay.update("Firmware Update", progressText, percent);
                              },
                              &downloadedBytesOut,
-                             error);
+                             error)) {
+      return false;
+    }
+  }
+
+  // Integrity check: if the release published a checksum for this asset, the
+  // downloaded binary must match it before we ever flash it.
+  if (!infoOut.expectedSha256.isEmpty()) {
+    OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Verifying checksum...", -1);
+    if (backgroundTick) {
+      backgroundTick();
+    }
+    const String actual = sha256OfSdFile(kLatestFirmwarePath);
+    if (actual.isEmpty()) {
+      SD.remove(kLatestFirmwarePath);
+      if (error) {
+        *error = "Checksum read failed";
+      }
+      return false;
+    }
+    if (actual != infoOut.expectedSha256) {
+      SD.remove(kLatestFirmwarePath);
+      if (error) {
+        *error = "SHA-256 mismatch (download rejected)";
+      }
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool installDownloaded(AppContext &ctx,
@@ -781,6 +900,21 @@ void runFirmwareUpdateApp(AppContext &ctx,
   String lastTag;
   String lastAsset;
 
+  // Resolve the active repo + board-matched asset from runtime config. The
+  // board asset (ZX_OS_BOARD_ASSET) is baked in per build env so the right
+  // binary is chosen automatically regardless of the saved config.
+  gRepoSlug = ctx.config.appMarketGithubRepo;
+  gRepoSlug.trim();
+  if (gRepoSlug.isEmpty()) {
+    gRepoSlug = kDefaultFirmwareRepoSlug;
+  }
+  gPreferredAsset = String(ZX_OS_BOARD_ASSET);
+  gPreferredAsset.trim();
+  if (gPreferredAsset.isEmpty()) {
+    gPreferredAsset = ctx.config.appMarketReleaseAsset;
+    gPreferredAsset.trim();
+  }
+
   while (true) {
     uint32_t latestSize = 0;
     const bool latestExists = ensureSdMounted(false, nullptr) &&
@@ -800,7 +934,7 @@ void runFirmwareUpdateApp(AppContext &ctx,
                                                 selected,
                                                 backgroundTick,
                                                 "OK Select  BACK Exit",
-                                                "Repo: " + trimMiddle(String(kFirmwareRepoSlug), 22));
+                                                "Repo: " + trimMiddle(gRepoSlug, 22));
     if (choice < 0 || choice == 5) {
       return;
     }
@@ -824,10 +958,18 @@ void runFirmwareUpdateApp(AppContext &ctx,
       lastAsset = info.assetName;
       lastAction = "Latest: " + info.tag + " / " + info.assetName;
 
+      const String current = String(ZX_OS_VERSION);
+      const bool upToDate = !current.isEmpty() && current != "dev" &&
+                            info.tag == current;
+
       std::vector<String> lines;
-      lines.push_back("Tag: " + info.tag);
+      lines.push_back("Current: " + current);
+      lines.push_back("Latest tag: " + info.tag);
+      lines.push_back(upToDate ? "Status: Up to date" : "Status: Update available");
       lines.push_back("Asset: " + info.assetName);
       lines.push_back("Size: " + formatBytes(info.size));
+      lines.push_back("Checksum: " +
+                      String(info.expectedSha256.isEmpty() ? "(not published)" : "SHA-256 ok"));
       lines.push_back("URL:");
       lines.push_back(trimMiddle(info.downloadUrl, 38));
       ctx.uiRuntime->showInfo("Latest Firmware", lines, backgroundTick, "OK/BACK Exit");

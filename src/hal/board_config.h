@@ -113,3 +113,13 @@
 #ifndef HAL_I2C_SCL
   #define HAL_I2C_SCL -1
 #endif
+
+// Infrared (IR) transceiver defaults. Boards without a built-in IR LED /
+// receiver leave these at -1; the IR app treats a negative pin as "not wired"
+// and the user can override them for their own hardware in user_config.h.
+#ifndef HAL_PIN_IR_TX
+  #define HAL_PIN_IR_TX -1
+#endif
+#ifndef HAL_PIN_IR_RX
+  #define HAL_PIN_IR_RX -1
+#endif

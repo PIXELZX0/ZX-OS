@@ -19,6 +19,7 @@ enum class AppId : uint8_t {
   Nfc = 5,
   Rfid = 6,
   Nrf24 = 7,
+  Ir = 8,
 };
 
 struct AppContext {

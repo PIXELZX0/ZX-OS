@@ -4,7 +4,9 @@
 
 #include "../apps/app_market_app.h"
 #include "../apps/file_explorer_app.h"
+#include "../apps/ir_app.h"
 #include "../apps/nfc_app.h"
+#include "../apps/rf_app.h"
 #include "../apps/rfid_app.h"
 #include "../apps/settings_app.h"
 #include "i18n.h"
@@ -22,6 +24,8 @@ void UiNavigator::runLauncher(AppContext &ctx,
   items.push_back(uiText(lang, UiTextKey::AppMarket));
   items.push_back(uiText(lang, UiTextKey::Settings));
   items.push_back(uiText(lang, UiTextKey::FileExplorer));
+  items.push_back(uiText(lang, UiTextKey::Rf));
+  items.push_back(uiText(lang, UiTextKey::Ir));
   items.push_back(uiText(lang, UiTextKey::Nfc));
   items.push_back(uiText(lang, UiTextKey::Rfid));
 
@@ -43,8 +47,12 @@ void UiNavigator::runLauncher(AppContext &ctx,
   } else if (choice == 2) {
     runFileExplorerApp(ctx, backgroundTick);
   } else if (choice == 3) {
-    runNfcApp(ctx, backgroundTick);
+    runRfApp(ctx, backgroundTick);
   } else if (choice == 4) {
+    runIrApp(ctx, backgroundTick);
+  } else if (choice == 5) {
+    runNfcApp(ctx, backgroundTick);
+  } else if (choice == 6) {
     runRfidApp(ctx, backgroundTick);
   }
 }

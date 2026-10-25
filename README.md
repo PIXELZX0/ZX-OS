@@ -8,7 +8,8 @@ It combines a launcher-based LVGL UI with wireless tooling, OpenClaw gateway int
 - A touchless launcher UX optimized for the T-Embed encoder + buttons.
 - Configuration persistence across reboot (SD + NVS fallback).
 - OpenClaw gateway connectivity (`ws://` and `wss://`) with token/password auth.
-- Wireless modules and utility apps (RF/CC1101, NFC, RFID, NRF24, BLE).
+- Wireless modules and utility apps (RF/CC1101 sub-GHz, IR remote, NFC, RFID, NRF24, BLE).
+- OTA firmware updates with board-matched release assets and SHA-256 verification.
 - SD-card utilities including browsing, previewing media, and package-based updates.
 
 > For full feature details and developer workflows, read:

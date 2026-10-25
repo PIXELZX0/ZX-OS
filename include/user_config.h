@@ -119,6 +119,18 @@
 #define USER_NRF24_DATA_RATE 1
 #define USER_NRF24_PA_LEVEL 1
 
+// --- Infrared (IR) transceiver (override per your wiring) ---
+#ifndef HAL_PIN_IR_TX
+  #define USER_IR_TX_PIN -1
+#else
+  #define USER_IR_TX_PIN HAL_PIN_IR_TX
+#endif
+#ifndef HAL_PIN_IR_RX
+  #define USER_IR_RX_PIN -1
+#else
+  #define USER_IR_RX_PIN HAL_PIN_IR_RX
+#endif
+
 // --- Telemetry ---
 #define USER_TELEMETRY_INTERVAL_MS 30000UL
 #define USER_AUTO_CONNECT_DEFAULT false

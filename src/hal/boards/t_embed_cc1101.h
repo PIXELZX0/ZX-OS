@@ -22,6 +22,7 @@
 #define HAL_HAS_MIC           1
 #define HAL_HAS_ANTENNA_SWITCH 1
 #define HAL_HAS_POWER_ENABLE  1
+#define HAL_HAS_IR            1
 
 // --- Power ---
 #define HAL_PIN_POWER_ENABLE  15
@@ -85,3 +86,9 @@
 #define HAL_PIN_RFID_RST      1
 #define HAL_PIN_NRF24_CE      17
 #define HAL_PIN_NRF24_CSN     14
+
+// --- Infrared (IR) transceiver (optional external wiring on the GROVE/UART header) ---
+// The base T-Embed CC1101 has no IR hardware. Wire an IR LED (via a transistor)
+// and a 38 kHz IR receiver to these pins, or override them in user_config.h.
+#define HAL_PIN_IR_TX         44
+#define HAL_PIN_IR_RX         43

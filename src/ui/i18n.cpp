@@ -32,6 +32,8 @@ const char *textEn(UiTextKey key) {
       return "RFID";
     case UiTextKey::Nrf24:
       return "NRF24";
+    case UiTextKey::Ir:
+      return "IR";
     case UiTextKey::OpenClaw:
       return "OpenClaw";
     case UiTextKey::Language:
@@ -99,6 +101,8 @@ const char *textKo(UiTextKey key) {
       return "RFID";
     case UiTextKey::Nrf24:
       return "NRF24";
+    case UiTextKey::Ir:
+      return "IR";
     case UiTextKey::OpenClaw:
       return "OpenClaw";
     case UiTextKey::Language:
