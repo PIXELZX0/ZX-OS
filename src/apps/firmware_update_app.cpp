@@ -8,28 +8,57 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <mbedtls/sha256.h>
 
 #include <algorithm>
+#include <cctype>
+#include <memory>
+#include <new>
 #include <vector>
 
 #include "../core/board_pins.h"
 #include "../core/shared_spi_bus.h"
 #include "../ui/ui_runtime.h"
 
+// Injected by scripts/firmware_version.py; fallbacks keep ad-hoc builds compiling.
+#ifndef ZX_FW_VERSION
+#define ZX_FW_VERSION "dev"
+#endif
+#ifndef ZX_BUILD_ENV
+#define ZX_BUILD_ENV "unknown"
+#endif
+#ifndef ZX_FW_REPO
+#define ZX_FW_REPO "PIXELZX0/ZX-OS"
+#endif
+
 namespace {
 
-constexpr const char *kFirmwareRepoSlug = "HITEYY/AI-cc1101";
+constexpr const char *kFirmwareRepoSlug = ZX_FW_REPO;
+constexpr const char *kAssetPrefix = "openclaw-";
+constexpr const char *kUserAgent = "ZX-OS-FirmwareUpdate";
 constexpr const char *kFirmwareDir = "/firmware";
 constexpr const char *kLatestFirmwarePath = "/firmware/latest.bin";
-constexpr size_t kTransferChunkBytes = 2048;
-constexpr unsigned long kDownloadIdleTimeoutMs = 12000UL;
+constexpr const char *kLatestShaPath = "/firmware/latest.bin.sha256";
+constexpr const char *kLatestTagPath = "/firmware/latest.tag";
+constexpr size_t kTransferChunkBytes = 4096;
+constexpr unsigned long kHttpTimeoutMs = 15000UL;
+constexpr unsigned long kDownloadIdleTimeoutMs = 15000UL;
+constexpr size_t kLatestReleaseDocBytes = 16384;
+constexpr size_t kReleaseListDocBytes = 32768;
+constexpr int kReleaseListPageSize = 4;
 
 struct ReleaseInfo {
   String tag;
   String assetName;
   String downloadUrl;
+  String sha256Url;
   uint32_t size = 0;
+  bool prerelease = false;
 };
+
+using ProgressFn = std::function<void(uint32_t written, uint32_t total)>;
+using BeginFn = std::function<bool(uint32_t contentLength, String *error)>;
+using ChunkFn = std::function<bool(const uint8_t *data, size_t len, String *error)>;
 
 bool gSdMountedForFirmware = false;
 
@@ -69,6 +98,32 @@ class OverlayScope {
   unsigned long lastUpdateMs_ = 0;
 };
 
+class Sha256 {
+ public:
+  Sha256() {
+    mbedtls_sha256_init(&ctx_);
+    mbedtls_sha256_starts(&ctx_, 0);
+  }
+  ~Sha256() { mbedtls_sha256_free(&ctx_); }
+  Sha256(const Sha256 &) = delete;
+  Sha256 &operator=(const Sha256 &) = delete;
+
+  void update(const uint8_t *data, size_t len) { mbedtls_sha256_update(&ctx_, data, len); }
+
+  String finishHex() {
+    uint8_t digest[32];
+    mbedtls_sha256_finish(&ctx_, digest);
+    char hex[65];
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+    return String(hex);
+  }
+
+ private:
+  mbedtls_sha256_context ctx_;
+};
+
 String formatBytes(uint64_t bytes) {
   static const char *kUnits[] = {"B", "KB", "MB", "GB"};
 
@@ -103,11 +158,111 @@ String trimMiddle(const String &value, size_t maxLength) {
          value.substring(value.length() - right);
 }
 
-bool hasBinExtension(const String &pathOrNameRaw) {
-  String pathOrName = pathOrNameRaw;
-  pathOrName.toLowerCase();
-  return pathOrName.endsWith(".bin");
+int percentOf(uint32_t written, uint32_t total) {
+  if (total == 0) {
+    return -1;
+  }
+  return static_cast<int>((static_cast<uint64_t>(written) * 100ULL) / total);
 }
+
+String progressText(const char *verb, uint32_t written, uint32_t total) {
+  String text = String(verb) + " " + formatBytes(written);
+  if (total > 0) {
+    text += " / " + formatBytes(total);
+  }
+  return text;
+}
+
+// Accepts "<64 hex>" or sha256sum output ("<64 hex>  name"); returns lowercase hex or "".
+String normalizeSha256(const String &raw) {
+  String value = raw;
+  value.trim();
+  const int space = value.indexOf(' ');
+  if (space > 0) {
+    value = value.substring(0, space);
+  }
+  value.toLowerCase();
+  if (value.length() != 64) {
+    return "";
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (!isxdigit(static_cast<unsigned char>(value[i]))) {
+      return "";
+    }
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// Version handling
+// ---------------------------------------------------------------------------
+
+struct ParsedVersion {
+  long part[3] = {0, 0, 0};
+  bool hasSuffix = false;  // "-rc1", "-dirty", ... sorts before the plain release
+};
+
+bool parseVersion(const String &raw, ParsedVersion &out) {
+  String value = raw;
+  value.trim();
+  if (value.startsWith("v") || value.startsWith("V")) {
+    value = value.substring(1);
+  }
+  if (value.isEmpty() || !isdigit(static_cast<unsigned char>(value[0]))) {
+    return false;
+  }
+
+  out = ParsedVersion();
+  size_t pos = 0;
+  for (int i = 0; i < 3 && pos < value.length(); ++i) {
+    if (!isdigit(static_cast<unsigned char>(value[pos]))) {
+      return false;
+    }
+    long number = 0;
+    while (pos < value.length() && isdigit(static_cast<unsigned char>(value[pos]))) {
+      number = number * 10 + (value[pos] - '0');
+      ++pos;
+    }
+    out.part[i] = number;
+    if (pos < value.length() && value[pos] == '.' && i < 2) {
+      ++pos;
+      continue;
+    }
+    break;
+  }
+  if (pos < value.length()) {
+    if (value[pos] != '-' && value[pos] != '+') {
+      return false;
+    }
+    out.hasSuffix = value[pos] == '-';
+  }
+  return true;
+}
+
+String currentVersion() { return String(ZX_FW_VERSION); }
+
+String buildEnvName() { return String(ZX_BUILD_ENV); }
+
+// True when `latestTag` should replace the running firmware. Unparseable versions
+// (e.g. dev builds tagged with a commit hash) fall back to "different means newer".
+bool isNewerThanCurrent(const String &latestTag) {
+  const String current = currentVersion();
+  ParsedVersion a;
+  ParsedVersion b;
+  if (!parseVersion(latestTag, a) || !parseVersion(current, b)) {
+    return latestTag != current;
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (a.part[i] != b.part[i]) {
+      return a.part[i] > b.part[i];
+    }
+  }
+  return !a.hasSuffix && b.hasSuffix;
+}
+
+// ---------------------------------------------------------------------------
+// SD helpers
+// ---------------------------------------------------------------------------
 
 bool ensureSdMounted(bool forceMount, String *error) {
   if (gSdMountedForFirmware && !forceMount) {
@@ -186,13 +341,46 @@ bool statSdFile(const String &path, uint32_t &sizeOut) {
   return true;
 }
 
-bool httpGetSecure(const String &url,
-                   String &responseOut,
-                   int &httpCodeOut,
-                   String *error) {
-  responseOut = "";
-  httpCodeOut = -1;
+String readSmallSdFile(const char *path, size_t maxBytes = 128) {
+  File file = SD.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) {
+      file.close();
+    }
+    return "";
+  }
+  String value;
+  while (file.available() && value.length() < maxBytes) {
+    value += static_cast<char>(file.read());
+  }
+  file.close();
+  value.trim();
+  return value;
+}
 
+bool writeSmallSdFile(const char *path, const String &value) {
+  if (SD.exists(path)) {
+    SD.remove(path);
+  }
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+  const size_t written = file.print(value);
+  file.close();
+  return written == value.length();
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+// TLS certificates are not validated (no CA bundle is embedded); integrity of the
+// firmware image is instead enforced by the SHA-256 published with each release.
+bool beginHttps(HTTPClient &http,
+                WiFiClientSecure &client,
+                const String &url,
+                String *error) {
   if (WiFi.status() != WL_CONNECTED) {
     if (error) {
       *error = "Wi-Fi is not connected";
@@ -200,10 +388,7 @@ bool httpGetSecure(const String &url,
     return false;
   }
 
-  WiFiClientSecure client;
   client.setInsecure();
-
-  HTTPClient http;
   if (!http.begin(client, url)) {
     if (error) {
       *error = "HTTP begin failed";
@@ -211,113 +396,301 @@ bool httpGetSecure(const String &url,
     return false;
   }
 
-  http.setTimeout(12000);
+  // HTTP/1.0 avoids chunked transfer encoding so the body can be streamed as-is.
+  http.useHTTP10(true);
+  http.setTimeout(kHttpTimeoutMs);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "AI-cc1101-FirmwareUpdate");
+  http.setUserAgent(kUserAgent);
+  return true;
+}
+
+String describeHttpFailure(HTTPClient &http, int code) {
+  if (code <= 0) {
+    return String("HTTP failed: ") + HTTPClient::errorToString(code);
+  }
+
+  String msg = "HTTP " + String(code);
+  StaticJsonDocument<64> filter;
+  filter["message"] = true;
+  DynamicJsonDocument doc(512);
+  if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
+    const String detail = String(static_cast<const char *>(doc["message"] | ""));
+    if (!detail.isEmpty()) {
+      msg += ": " + trimMiddle(detail, 40);
+    }
+  }
+  if (code == 403 || code == 429) {
+    msg += " (rate limited?)";
+  }
+  return msg;
+}
+
+bool httpGetJson(const String &url,
+                 const JsonDocument &filter,
+                 DynamicJsonDocument &docOut,
+                 int &httpCodeOut,
+                 String *error) {
+  httpCodeOut = -1;
+
+  WiFiClientSecure client;
+  HTTPClient http;
+  if (!beginHttps(http, client, url, error)) {
+    return false;
+  }
   http.addHeader("Accept", "application/vnd.github+json");
+  http.addHeader("X-GitHub-Api-Version", "2022-11-28");
 
   const int code = http.GET();
   httpCodeOut = code;
-  if (code > 0) {
-    responseOut = http.getString();
-  }
-  http.end();
-
-  if (code <= 0) {
+  if (code != HTTP_CODE_OK) {
     if (error) {
-      *error = "HTTP request failed";
+      *error = describeHttpFailure(http, code);
     }
+    http.end();
     return false;
   }
-  if (code < 200 || code >= 300) {
+
+  const DeserializationError parseErr =
+      deserializeJson(docOut, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (parseErr) {
     if (error) {
-      String msg = "HTTP " + String(code);
-      DynamicJsonDocument doc(768);
-      const auto parseErr = deserializeJson(doc, responseOut);
-      if (!parseErr && doc.is<JsonObjectConst>()) {
-        const String detail = String(static_cast<const char *>(doc["message"] | ""));
-        if (!detail.isEmpty()) {
-          msg += ": " + detail;
-        }
-      }
-      *error = msg;
+      *error = String("Release JSON parse failed: ") + parseErr.c_str();
     }
     return false;
   }
   return true;
 }
 
-bool parseLatestReleaseBody(const String &body,
-                            const String &preferredAssetNameRaw,
-                            ReleaseInfo &infoOut,
-                            String *error) {
-  DynamicJsonDocument doc(32768);
-  const auto parseErr = deserializeJson(doc, body);
-  if (parseErr || !doc.is<JsonObject>()) {
-    if (error) {
-      *error = "Release JSON parse failed";
-    }
+bool httpGetSmallText(const String &url, String &out, String *error) {
+  out = "";
+
+  WiFiClientSecure client;
+  HTTPClient http;
+  if (!beginHttps(http, client, url, error)) {
     return false;
   }
 
-  const JsonObjectConst root = doc.as<JsonObjectConst>();
-  infoOut.tag = String(static_cast<const char *>(root["tag_name"] | ""));
-  if (infoOut.tag.isEmpty()) {
-    infoOut.tag = String(static_cast<const char *>(root["name"] | ""));
-  }
-  if (infoOut.tag.isEmpty()) {
-    infoOut.tag = "(unknown)";
-  }
-
-  if (!root["assets"].is<JsonArrayConst>()) {
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
     if (error) {
-      *error = "Release has no assets";
+      *error = code <= 0 ? String("HTTP failed: ") + HTTPClient::errorToString(code)
+                         : "HTTP " + String(code);
     }
+    http.end();
     return false;
   }
 
-  const JsonArrayConst assets = root["assets"].as<JsonArrayConst>();
-  if (assets.size() == 0) {
-    if (error) {
-      *error = "Release has empty assets";
-    }
-    return false;
-  }
-
-  String preferredAssetName = preferredAssetNameRaw;
-  preferredAssetName.trim();
-
-  JsonObjectConst selected;
-  if (!preferredAssetName.isEmpty()) {
-    for (JsonObjectConst asset : assets) {
-      const String name = String(static_cast<const char *>(asset["name"] | ""));
-      if (name == preferredAssetName) {
-        selected = asset;
+  WiFiClient &stream = http.getStream();
+  const unsigned long startMs = millis();
+  while (out.length() < 256 && millis() - startMs < kHttpTimeoutMs) {
+    const int c = stream.read();
+    if (c < 0) {
+      if (!http.connected()) {
         break;
       }
+      delay(2);
+      continue;
     }
+    out += static_cast<char>(c);
+  }
+  http.end();
+  return true;
+}
+
+// Streams an HTTP body into `onChunk`. Fails on HTTP errors, stalls, and
+// truncated bodies (fewer bytes than Content-Length or `expectedSize`).
+bool streamHttpBody(const String &url,
+                    uint32_t expectedSize,
+                    const BeginFn &onBegin,
+                    const ChunkFn &onChunk,
+                    const std::function<void()> &backgroundTick,
+                    const ProgressFn &progressTick,
+                    uint32_t *bytesOut,
+                    String *error) {
+  if (bytesOut) {
+    *bytesOut = 0;
   }
 
-  if (selected.isNull()) {
-    for (JsonObjectConst asset : assets) {
-      const String name = String(static_cast<const char *>(asset["name"] | ""));
-      if (hasBinExtension(name)) {
-        selected = asset;
+  WiFiClientSecure client;
+  HTTPClient http;
+  if (!beginHttps(http, client, url, error)) {
+    return false;
+  }
+
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    if (error) {
+      *error = code <= 0 ? String("Download failed: ") + HTTPClient::errorToString(code)
+                         : "Download HTTP " + String(code);
+    }
+    http.end();
+    return false;
+  }
+
+  const int contentLength = http.getSize();
+  if (contentLength > 0 && expectedSize > 0 &&
+      static_cast<uint32_t>(contentLength) != expectedSize) {
+    http.end();
+    if (error) {
+      *error = "Size mismatch: server " + formatBytes(contentLength) +
+               ", release " + formatBytes(expectedSize);
+    }
+    return false;
+  }
+  const uint32_t total = contentLength > 0 ? static_cast<uint32_t>(contentLength) : expectedSize;
+
+  if (onBegin && !onBegin(total, error)) {
+    http.end();
+    return false;
+  }
+
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[kTransferChunkBytes]);
+  if (!buffer) {
+    http.end();
+    if (error) {
+      *error = "Out of memory";
+    }
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  uint32_t writtenTotal = 0;
+  unsigned long lastDataMs = millis();
+  if (progressTick) {
+    progressTick(0, total);
+  }
+
+  while (total == 0 || writtenTotal < total) {
+    const size_t available = stream->available();
+    if (available == 0) {
+      if (!http.connected()) {
         break;
       }
+      if (millis() - lastDataMs > kDownloadIdleTimeoutMs) {
+        http.end();
+        if (error) {
+          *error = "Download stalled at " + formatBytes(writtenTotal);
+        }
+        return false;
+      }
+      delay(2);
+      if (backgroundTick) {
+        backgroundTick();
+      }
+      continue;
+    }
+
+    size_t toRead = std::min(available, kTransferChunkBytes);
+    if (total > 0) {
+      toRead = std::min(toRead, static_cast<size_t>(total - writtenTotal));
+    }
+    const int readLen = stream->readBytes(buffer.get(), toRead);
+    if (readLen <= 0) {
+      continue;
+    }
+
+    if (!onChunk(buffer.get(), static_cast<size_t>(readLen), error)) {
+      http.end();
+      return false;
+    }
+
+    writtenTotal += static_cast<uint32_t>(readLen);
+    lastDataMs = millis();
+    if (progressTick) {
+      progressTick(writtenTotal, total);
+    }
+    if (backgroundTick) {
+      backgroundTick();
+    }
+  }
+  http.end();
+
+  if (writtenTotal == 0) {
+    if (error) {
+      *error = "Downloaded file is empty";
+    }
+    return false;
+  }
+  if (total > 0 && writtenTotal != total) {
+    if (error) {
+      *error = "Download incomplete: " + formatBytes(writtenTotal) + " / " + formatBytes(total);
+    }
+    return false;
+  }
+
+  if (bytesOut) {
+    *bytesOut = writtenTotal;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Release lookup
+// ---------------------------------------------------------------------------
+
+void buildReleaseFilter(JsonObject release) {
+  release["tag_name"] = true;
+  release["name"] = true;
+  release["draft"] = true;
+  release["prerelease"] = true;
+  JsonObject asset = release["assets"].createNestedArray().createNestedObject();
+  asset["name"] = true;
+  asset["browser_download_url"] = true;
+  asset["size"] = true;
+}
+
+// Picks this board's firmware ("openclaw-<env>-<tag>.bin", else the
+// "-latest.bin" alias) and its ".sha256" sidecar from a release.
+bool selectBoardAsset(JsonObjectConst release, ReleaseInfo &infoOut, String *error) {
+  if (release["draft"] | false) {
+    return false;
+  }
+
+  infoOut = ReleaseInfo();
+  infoOut.tag = String(static_cast<const char *>(release["tag_name"] | ""));
+  if (infoOut.tag.isEmpty()) {
+    infoOut.tag = String(static_cast<const char *>(release["name"] | ""));
+  }
+  infoOut.prerelease = release["prerelease"] | false;
+
+  const String base = String(kAssetPrefix) + buildEnvName() + "-";
+  const String versionedName = base + infoOut.tag + ".bin";
+  const String aliasName = base + "latest.bin";
+
+  JsonObjectConst versioned;
+  JsonObjectConst alias;
+  String versionedSha;
+  String aliasSha;
+  for (JsonObjectConst asset : release["assets"].as<JsonArrayConst>()) {
+    const String name = String(static_cast<const char *>(asset["name"] | ""));
+    const String url = String(static_cast<const char *>(asset["browser_download_url"] | ""));
+    if (name == versionedName) {
+      versioned = asset;
+    } else if (name == aliasName) {
+      alias = asset;
+    } else if (name == versionedName + ".sha256") {
+      versionedSha = url;
+    } else if (name == aliasName + ".sha256") {
+      aliasSha = url;
     }
   }
 
+  const bool useVersioned = !versioned.isNull();
+  const JsonObjectConst selected = useVersioned ? versioned : alias;
   if (selected.isNull()) {
-    selected = assets[0];
+    if (error) {
+      *error = "No " + buildEnvName() + " firmware in " +
+               (infoOut.tag.isEmpty() ? String("release") : infoOut.tag);
+    }
+    return false;
   }
 
   infoOut.assetName = String(static_cast<const char *>(selected["name"] | ""));
-  infoOut.downloadUrl =
-      String(static_cast<const char *>(selected["browser_download_url"] | ""));
+  infoOut.downloadUrl = String(static_cast<const char *>(selected["browser_download_url"] | ""));
   infoOut.size = selected["size"] | 0;
-
-  if (infoOut.assetName.isEmpty() || infoOut.downloadUrl.isEmpty()) {
+  infoOut.sha256Url = useVersioned ? versionedSha : aliasSha;
+  if (infoOut.downloadUrl.isEmpty()) {
     if (error) {
       *error = "Release asset URL missing";
     }
@@ -326,340 +699,132 @@ bool parseLatestReleaseBody(const String &body,
   return true;
 }
 
-bool parseReleaseCatalogBody(const String &body,
-                             ReleaseInfo &infoOut,
-                             String *error) {
-  DynamicJsonDocument doc(65536);
-  const auto parseErr = deserializeJson(doc, body);
-  if (parseErr || !doc.is<JsonArrayConst>()) {
-    if (error) {
-      *error = "Release list parse failed";
+bool fetchLatestReleaseInfo(ReleaseInfo &infoOut, String *error) {
+  const String apiBase = "https://api.github.com/repos/" + String(kFirmwareRepoSlug);
+
+  {
+    StaticJsonDocument<384> filter;
+    buildReleaseFilter(filter.to<JsonObject>());
+    DynamicJsonDocument doc(kLatestReleaseDocBytes);
+    int code = -1;
+    String latestErr;
+    if (httpGetJson(apiBase + "/releases/latest", filter, doc, code, &latestErr)) {
+      return selectBoardAsset(doc.as<JsonObjectConst>(), infoOut, error);
     }
-    return false;
-  }
-
-  const JsonArrayConst roots = doc.as<JsonArrayConst>();
-  for (JsonObjectConst root : roots) {
-    if (root["draft"] | false) {
-      continue;
-    }
-    if (!root["assets"].is<JsonArrayConst>()) {
-      continue;
-    }
-
-    const JsonArrayConst assets = root["assets"].as<JsonArrayConst>();
-    if (assets.size() == 0) {
-      continue;
-    }
-
-    JsonObjectConst selected;
-    for (JsonObjectConst asset : assets) {
-      const String name = String(static_cast<const char *>(asset["name"] | ""));
-      if (hasBinExtension(name)) {
-        selected = asset;
-        break;
-      }
-    }
-    if (selected.isNull()) {
-      selected = assets[0];
-    }
-
-    infoOut.tag = String(static_cast<const char *>(root["tag_name"] | ""));
-    if (infoOut.tag.isEmpty()) {
-      infoOut.tag = String(static_cast<const char *>(root["name"] | ""));
-    }
-    if (infoOut.tag.isEmpty()) {
-      infoOut.tag = "(unknown)";
-    }
-
-    infoOut.assetName = String(static_cast<const char *>(selected["name"] | ""));
-    infoOut.downloadUrl =
-        String(static_cast<const char *>(selected["browser_download_url"] | ""));
-    infoOut.size = selected["size"] | 0;
-
-    if (!infoOut.assetName.isEmpty() && !infoOut.downloadUrl.isEmpty()) {
-      return true;
-    }
-  }
-
-  if (error) {
-    *error = "No releases with downloadable assets";
-  }
-  return false;
-}
-
-bool fetchLatestReleaseInfo(ReleaseInfo &infoOut,
-                            String *error) {
-  const String latestUrl = "https://api.github.com/repos/" + String(kFirmwareRepoSlug) +
-                           "/releases/latest";
-  String latestBody;
-  int latestCode = -1;
-  String latestErr;
-  if (httpGetSecure(latestUrl, latestBody, latestCode, &latestErr)) {
-    return parseLatestReleaseBody(latestBody, "", infoOut, error);
-  }
-
-  const String listUrl = "https://api.github.com/repos/" + String(kFirmwareRepoSlug) +
-                         "/releases?per_page=8";
-  String listBody;
-  int listCode = -1;
-  String listErr;
-  if (httpGetSecure(listUrl, listBody, listCode, &listErr)) {
-    if (parseReleaseCatalogBody(listBody, infoOut, error)) {
-      return true;
-    }
-    if (error) {
-      *error = "No published firmware release found. Publish a GitHub Release with a .bin asset.";
-    }
-    return false;
-  }
-  if (error) {
-    *error = latestErr + " / " + listErr;
-  }
-  return false;
-}
-
-bool downloadUrlToSdFile(const String &url,
-                         const char *destPath,
-                         const std::function<void()> &backgroundTick,
-                         const std::function<void(uint32_t, int)> &progressTick,
-                         uint32_t *bytesOut,
-                         String *error) {
-  if (bytesOut) {
-    *bytesOut = 0;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    if (error) {
-      *error = "Wi-Fi is not connected";
-    }
-    return false;
-  }
-
-  String sdErr;
-  if (!ensureSdMounted(false, &sdErr)) {
-    if (error) {
-      *error = sdErr;
-    }
-    return false;
-  }
-  if (!ensureFirmwareDirectory(&sdErr)) {
-    if (error) {
-      *error = sdErr;
-    }
-    return false;
-  }
-
-  const String tempPath = String(destPath) + ".tmp";
-  if (SD.exists(tempPath.c_str())) {
-    SD.remove(tempPath.c_str());
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    if (error) {
-      *error = "HTTP begin failed";
-    }
-    return false;
-  }
-
-  http.setTimeout(15000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "AI-cc1101-FirmwareUpdate");
-
-  const int code = http.GET();
-  const int totalSize = http.getSize();
-  if (code <= 0 || code < 200 || code >= 300) {
-    const String response = code > 0 ? http.getString() : String("");
-    http.end();
-    if (error) {
-      String msg = code <= 0 ? String("Download HTTP failed")
-                             : String("HTTP ") + String(code);
-      if (!response.isEmpty()) {
-        msg += ": " + trimMiddle(response, 40);
-      }
-      *error = msg;
-    }
-    return false;
-  }
-
-  File file = SD.open(tempPath.c_str(), FILE_WRITE);
-  if (!file || file.isDirectory()) {
-    if (file) {
-      file.close();
-    }
-    http.end();
-    if (error) {
-      *error = "SD file open failed";
-    }
-    return false;
-  }
-
-  WiFiClient *stream = http.getStreamPtr();
-  int remain = http.getSize();
-  uint8_t buffer[kTransferChunkBytes];
-  uint32_t writtenTotal = 0;
-  unsigned long lastProgressMs = millis();
-  if (progressTick) {
-    progressTick(0, totalSize);
-  }
-
-  while (http.connected() && (remain > 0 || remain == -1)) {
-    const size_t available = stream->available();
-    if (available == 0) {
-      if (millis() - lastProgressMs > kDownloadIdleTimeoutMs) {
-        file.close();
-        http.end();
-        SD.remove(tempPath.c_str());
-        if (error) {
-          *error = "Download timeout";
-        }
-        return false;
-      }
-      delay(5);
-      if (backgroundTick) {
-        backgroundTick();
-      }
-      continue;
-    }
-
-    const size_t toRead = std::min(available, sizeof(buffer));
-    const int readLen = stream->readBytes(buffer, toRead);
-    if (readLen <= 0) {
-      continue;
-    }
-
-    const size_t written = file.write(buffer, static_cast<size_t>(readLen));
-    if (written != static_cast<size_t>(readLen)) {
-      file.close();
-      http.end();
-      SD.remove(tempPath.c_str());
+    // 404 just means there is no stable release yet; try pre-releases below.
+    if (code != HTTP_CODE_NOT_FOUND) {
       if (error) {
-        *error = "SD write failed";
+        *error = latestErr;
       }
       return false;
     }
-
-    writtenTotal += static_cast<uint32_t>(written);
-    if (remain > 0) {
-      remain -= static_cast<int>(written);
-    }
-
-    lastProgressMs = millis();
-    if (progressTick) {
-      progressTick(writtenTotal, totalSize);
-    }
-    if (backgroundTick) {
-      backgroundTick();
-    }
   }
 
-  file.close();
-  http.end();
-
-  if (writtenTotal == 0) {
-    SD.remove(tempPath.c_str());
-    if (error) {
-      *error = "Downloaded file is empty";
-    }
+  StaticJsonDocument<448> filter;
+  buildReleaseFilter(filter.to<JsonArray>().createNestedObject());
+  DynamicJsonDocument doc(kReleaseListDocBytes);
+  int code = -1;
+  if (!httpGetJson(apiBase + "/releases?per_page=" + String(kReleaseListPageSize),
+                   filter,
+                   doc,
+                   code,
+                   error)) {
     return false;
   }
 
-  if (SD.exists(destPath)) {
-    SD.remove(destPath);
+  String firstErr;
+  for (JsonObjectConst release : doc.as<JsonArrayConst>()) {
+    String err;
+    if (selectBoardAsset(release, infoOut, &err)) {
+      return true;
+    }
+    if (firstErr.isEmpty()) {
+      firstErr = err;
+    }
   }
-  if (!SD.rename(tempPath.c_str(), destPath)) {
-    SD.remove(tempPath.c_str());
+  if (error) {
+    *error = firstErr.isEmpty() ? String("No published firmware release found") : firstErr;
+  }
+  return false;
+}
+
+// Empty `shaOut` with a true result means the release publishes no checksum.
+bool fetchExpectedSha256(const ReleaseInfo &info, String &shaOut, String *error) {
+  shaOut = "";
+  if (info.sha256Url.isEmpty()) {
+    return true;
+  }
+
+  String body;
+  String err;
+  if (!httpGetSmallText(info.sha256Url, body, &err)) {
     if (error) {
-      *error = "SD rename failed";
+      *error = "Checksum download failed: " + err;
     }
     return false;
   }
-
-  if (bytesOut) {
-    *bytesOut = writtenTotal;
-  }
-  if (progressTick) {
-    progressTick(writtenTotal, totalSize);
+  shaOut = normalizeSha256(body);
+  if (shaOut.isEmpty()) {
+    if (error) {
+      *error = "Checksum file is malformed";
+    }
+    return false;
   }
   return true;
 }
 
-bool installFirmwareFromSd(const String &path,
-                           const std::function<void()> &backgroundTick,
-                           const std::function<void(size_t, size_t)> &progressTick,
-                           String *error) {
-  String sdErr;
-  if (!ensureSdMounted(false, &sdErr)) {
+bool checkSha256(const String &expected, const String &actual, String *error) {
+  if (expected.isEmpty() || expected == actual) {
+    return true;
+  }
+  if (error) {
+    *error = "SHA-256 mismatch (got " + actual.substring(0, 8) + ", want " +
+             expected.substring(0, 8) + ")";
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Flashing
+// ---------------------------------------------------------------------------
+
+bool beginFlash(uint32_t size, String *error) {
+  if (Update.isRunning()) {
+    Update.abort();
+  }
+  if (size > 0 && size > ESP.getFreeSketchSpace()) {
     if (error) {
-      *error = sdErr;
+      *error = "Image " + formatBytes(size) + " exceeds OTA slot " +
+               formatBytes(ESP.getFreeSketchSpace());
     }
     return false;
   }
-
-  File file = SD.open(path.c_str(), FILE_READ);
-  if (!file || file.isDirectory()) {
-    if (file) {
-      file.close();
-    }
-    if (error) {
-      *error = "Firmware file open failed";
-    }
-    return false;
-  }
-
-  const size_t size = file.size();
-  if (size == 0) {
-    file.close();
-    if (error) {
-      *error = "Firmware file is empty";
-    }
-    return false;
-  }
-
-  if (!Update.begin(size, U_FLASH)) {
-    file.close();
+  if (!Update.begin(size > 0 ? size : UPDATE_SIZE_UNKNOWN, U_FLASH)) {
     if (error) {
       *error = String("Update begin failed: ") + Update.errorString();
     }
     return false;
   }
+  return true;
+}
 
-  uint8_t buffer[kTransferChunkBytes];
-  size_t writtenTotal = 0;
-  if (progressTick) {
-    progressTick(0, size);
+bool writeFlash(const uint8_t *data, size_t len, String *error) {
+  if (Update.write(const_cast<uint8_t *>(data), len) != len) {
+    if (error) {
+      *error = String("Flash write failed: ") + Update.errorString();
+    }
+    return false;
   }
-  while (file.available()) {
-    const int readLen = file.read(buffer, sizeof(buffer));
-    if (readLen <= 0) {
-      continue;
-    }
+  return true;
+}
 
-    const size_t written = Update.write(buffer, static_cast<size_t>(readLen));
-    if (written != static_cast<size_t>(readLen)) {
-      file.close();
-      Update.abort();
-      if (error) {
-        *error = String("Update write failed: ") + Update.errorString();
-      }
-      return false;
-    }
-    writtenTotal += written;
-    if (progressTick) {
-      progressTick(writtenTotal, size);
-    }
-
-    if (backgroundTick) {
-      backgroundTick();
-    }
+// Only commits the new image when its hash matches; otherwise the current
+// firmware stays bootable.
+bool finishFlash(const String &expectedSha, Sha256 &hasher, String *error) {
+  if (!checkSha256(expectedSha, hasher.finishHex(), error)) {
+    Update.abort();
+    return false;
   }
-
-  file.close();
-
   if (!Update.end(true)) {
     if (error) {
       *error = String("Update end failed: ") + Update.errorString();
@@ -672,13 +837,201 @@ bool installFirmwareFromSd(const String &path,
     }
     return false;
   }
-
-  if (progressTick) {
-    progressTick(size, size);
-  }
-
   return true;
 }
+
+bool flashFromUrl(const ReleaseInfo &info,
+                  const String &expectedSha,
+                  const std::function<void()> &backgroundTick,
+                  const ProgressFn &progressTick,
+                  String *error) {
+  Sha256 hasher;
+  const bool streamed = streamHttpBody(
+      info.downloadUrl,
+      info.size,
+      [&](uint32_t total, String *err) { return beginFlash(total, err); },
+      [&](const uint8_t *data, size_t len, String *err) {
+        hasher.update(data, len);
+        return writeFlash(data, len, err);
+      },
+      backgroundTick,
+      progressTick,
+      nullptr,
+      error);
+  if (!streamed) {
+    if (Update.isRunning()) {
+      Update.abort();
+    }
+    return false;
+  }
+  return finishFlash(expectedSha, hasher, error);
+}
+
+bool downloadToSd(const ReleaseInfo &info,
+                  const String &expectedSha,
+                  const std::function<void()> &backgroundTick,
+                  const ProgressFn &progressTick,
+                  uint32_t *bytesOut,
+                  String *error) {
+  String sdErr;
+  if (!ensureSdMounted(false, &sdErr) || !ensureFirmwareDirectory(&sdErr)) {
+    if (error) {
+      *error = sdErr;
+    }
+    return false;
+  }
+
+  const String tempPath = String(kLatestFirmwarePath) + ".tmp";
+  if (SD.exists(tempPath.c_str())) {
+    SD.remove(tempPath.c_str());
+  }
+  File file = SD.open(tempPath.c_str(), FILE_WRITE);
+  if (!file || file.isDirectory()) {
+    if (file) {
+      file.close();
+    }
+    if (error) {
+      *error = "SD file open failed";
+    }
+    return false;
+  }
+
+  Sha256 hasher;
+  const bool streamed = streamHttpBody(
+      info.downloadUrl,
+      info.size,
+      nullptr,
+      [&](const uint8_t *data, size_t len, String *err) {
+        hasher.update(data, len);
+        if (file.write(data, len) != len) {
+          if (err) {
+            *err = "SD write failed";
+          }
+          return false;
+        }
+        return true;
+      },
+      backgroundTick,
+      progressTick,
+      bytesOut,
+      error);
+  file.close();
+
+  const String actualSha = streamed ? hasher.finishHex() : String("");
+  if (!streamed || !checkSha256(expectedSha, actualSha, error)) {
+    SD.remove(tempPath.c_str());
+    return false;
+  }
+
+  if (SD.exists(kLatestFirmwarePath)) {
+    SD.remove(kLatestFirmwarePath);
+  }
+  if (!SD.rename(tempPath.c_str(), kLatestFirmwarePath)) {
+    SD.remove(tempPath.c_str());
+    if (error) {
+      *error = "SD rename failed";
+    }
+    return false;
+  }
+
+  // The sidecar lets "Install from SD" re-verify the image before committing it.
+  writeSmallSdFile(kLatestShaPath, actualSha);
+  writeSmallSdFile(kLatestTagPath, info.tag);
+  return true;
+}
+
+bool flashFromSd(const std::function<void()> &backgroundTick,
+                 const ProgressFn &progressTick,
+                 String *error) {
+  String sdErr;
+  if (!ensureSdMounted(false, &sdErr)) {
+    if (error) {
+      *error = sdErr;
+    }
+    return false;
+  }
+
+  File file = SD.open(kLatestFirmwarePath, FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) {
+      file.close();
+    }
+    if (error) {
+      *error = "Firmware file open failed";
+    }
+    return false;
+  }
+
+  const uint32_t size = static_cast<uint32_t>(file.size());
+  if (size == 0) {
+    file.close();
+    if (error) {
+      *error = "Firmware file is empty";
+    }
+    return false;
+  }
+
+  const String expectedSha = normalizeSha256(readSmallSdFile(kLatestShaPath));
+  if (!beginFlash(size, error)) {
+    file.close();
+    return false;
+  }
+
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[kTransferChunkBytes]);
+  if (!buffer) {
+    file.close();
+    Update.abort();
+    if (error) {
+      *error = "Out of memory";
+    }
+    return false;
+  }
+
+  Sha256 hasher;
+  uint32_t writtenTotal = 0;
+  if (progressTick) {
+    progressTick(0, size);
+  }
+  while (writtenTotal < size) {
+    const int readLen = file.read(buffer.get(), kTransferChunkBytes);
+    if (readLen <= 0) {
+      break;
+    }
+    hasher.update(buffer.get(), static_cast<size_t>(readLen));
+    if (!writeFlash(buffer.get(), static_cast<size_t>(readLen), error)) {
+      file.close();
+      Update.abort();
+      return false;
+    }
+    writtenTotal += static_cast<uint32_t>(readLen);
+    if (progressTick) {
+      progressTick(writtenTotal, size);
+    }
+    if (backgroundTick) {
+      backgroundTick();
+    }
+  }
+  file.close();
+
+  if (writtenTotal != size) {
+    Update.abort();
+    if (error) {
+      *error = "SD read failed at " + formatBytes(writtenTotal);
+    }
+    return false;
+  }
+  return finishFlash(expectedSha, hasher, error);
+}
+
+// ---------------------------------------------------------------------------
+// UI flows
+// ---------------------------------------------------------------------------
+
+struct UpdateSession {
+  String lastAction;
+  ReleaseInfo latest;
+  bool haveLatest = false;
+};
 
 bool confirmInstall(AppContext &ctx,
                     const String &title,
@@ -687,235 +1040,290 @@ bool confirmInstall(AppContext &ctx,
   if (!ctx.uiRuntime->confirm(title, message, backgroundTick, "Install", "Cancel")) {
     return false;
   }
-  if (!ctx.uiRuntime->confirm("Confirm Again",
-                              "Device will reboot after install",
-                              backgroundTick,
-                              "Install",
-                              "Cancel")) {
-    return false;
+  return ctx.uiRuntime->confirm("Confirm Again",
+                                "Device will reboot after install",
+                                backgroundTick,
+                                "Install",
+                                "Cancel");
+}
+
+void rebootAfterInstall(AppContext &ctx, const std::function<void()> &backgroundTick) {
+  ctx.uiRuntime->showToast("Firmware", "Install complete, rebooting", 1200, backgroundTick);
+  delay(300);
+  ESP.restart();
+}
+
+bool checkLatest(AppContext &ctx,
+                 UpdateSession &session,
+                 const std::function<void()> &backgroundTick) {
+  String err;
+  bool ok = false;
+  {
+    OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Checking GitHub releases...", -1);
+    ok = fetchLatestReleaseInfo(session.latest, &err);
   }
-  return true;
+  session.haveLatest = ok;
+  if (!ok) {
+    session.lastAction = "Check failed: " + err;
+    ctx.uiRuntime->showToast("Firmware", err, 2000, backgroundTick);
+  }
+  return ok;
 }
 
 void showStatus(AppContext &ctx,
-                const String &lastAction,
-                const String &lastTag,
-                const String &lastAsset,
+                const UpdateSession &session,
                 const std::function<void()> &backgroundTick) {
-  uint32_t latestSize = 0;
-
-  String sdErr;
-  if (ensureSdMounted(false, &sdErr)) {
-    statSdFile(kLatestFirmwarePath, latestSize);
+  std::vector<String> lines;
+  lines.push_back("Current: " + currentVersion());
+  lines.push_back("Board: " + buildEnvName());
+  lines.push_back("Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
+  lines.push_back("OTA slot: " + formatBytes(ESP.getFreeSketchSpace()));
+  if (session.haveLatest) {
+    lines.push_back("Latest: " + session.latest.tag +
+                    (isNewerThanCurrent(session.latest.tag) ? " (update)" : " (current)"));
+  } else {
+    lines.push_back("Latest: (not checked)");
   }
 
-  std::vector<String> lines;
-  lines.push_back("Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
+#if HAL_HAS_SD_CARD
+  uint32_t sdSize = 0;
+  if (ensureSdMounted(false, nullptr) && statSdFile(kLatestFirmwarePath, sdSize)) {
+    const String tag = readSmallSdFile(kLatestTagPath);
+    lines.push_back("SD: " + (tag.isEmpty() ? String("latest.bin") : tag) + " " +
+                    formatBytes(sdSize));
+  } else {
+    lines.push_back("SD: (no package)");
+  }
+#endif
+
   lines.push_back("Repo: " + String(kFirmwareRepoSlug));
-  lines.push_back("Asset: (auto .bin)");
-  lines.push_back("Latest tag: " + (lastTag.isEmpty() ? String("-") : lastTag));
-  lines.push_back("Latest asset: " + (lastAsset.isEmpty() ? String("-") : lastAsset));
-  lines.push_back("Downloaded: " +
-                  (latestSize == 0 ? String("(none)")
-                                   : String(kLatestFirmwarePath) + " " + formatBytes(latestSize)));
-  if (!lastAction.isEmpty()) {
-    lines.push_back("Last: " + lastAction);
+  if (!session.lastAction.isEmpty()) {
+    lines.push_back("Last: " + session.lastAction);
   }
 
   ctx.uiRuntime->showInfo("Firmware Status", lines, backgroundTick, "OK/BACK Exit");
 }
 
-bool downloadLatest(AppContext &ctx,
-                    ReleaseInfo &infoOut,
-                    uint32_t &downloadedBytesOut,
-                    const std::function<void()> &backgroundTick,
-                    String *error) {
-  if (!fetchLatestReleaseInfo(infoOut, error)) {
-    return false;
+// Downloads and flashes directly over Wi-Fi; no SD card needed.
+void updateOverTheAir(AppContext &ctx,
+                      UpdateSession &session,
+                      const std::function<void()> &backgroundTick) {
+  if (!checkLatest(ctx, session, backgroundTick)) {
+    return;
+  }
+  const ReleaseInfo &info = session.latest;
+
+  String prompt;
+  if (isNewerThanCurrent(info.tag)) {
+    prompt = currentVersion() + " -> " + info.tag + " (" + formatBytes(info.size) + ")";
+  } else {
+    prompt = "Already on " + info.tag + ". Reinstall?";
+  }
+  if (!confirmInstall(ctx, "Update Firmware", prompt, backgroundTick)) {
+    return;
   }
 
-  downloadedBytesOut = 0;
-  OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Preparing download...", -1);
-  return downloadUrlToSdFile(infoOut.downloadUrl,
-                             kLatestFirmwarePath,
-                             backgroundTick,
-                             [&](uint32_t written, int total) {
-                               int percent = -1;
-                               String progressText = "Downloading " + formatBytes(written);
-                               if (total > 0) {
-                                 percent = static_cast<int>((static_cast<uint64_t>(written) * 100ULL) /
-                                                            static_cast<uint64_t>(total));
-                                 progressText += " / " + formatBytes(static_cast<uint32_t>(total));
-                               }
-                               overlay.update("Firmware Update", progressText, percent);
-                             },
-                             &downloadedBytesOut,
-                             error);
+  String err;
+  String expectedSha;
+  if (!fetchExpectedSha256(info, expectedSha, &err)) {
+    session.lastAction = "Update failed: " + err;
+    ctx.uiRuntime->showToast("Firmware", err, 2000, backgroundTick);
+    return;
+  }
+  if (expectedSha.isEmpty() &&
+      !ctx.uiRuntime->confirm("No Checksum",
+                              "Release has no SHA-256. Flash anyway?",
+                              backgroundTick,
+                              "Flash",
+                              "Cancel")) {
+    return;
+  }
+
+  bool ok = false;
+  {
+    OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Connecting...", 0);
+    ok = flashFromUrl(info,
+                      expectedSha,
+                      backgroundTick,
+                      [&](uint32_t written, uint32_t total) {
+                        overlay.update("Firmware Update",
+                                       progressText("Flashing", written, total),
+                                       percentOf(written, total));
+                      },
+                      &err);
+  }
+  if (!ok) {
+    session.lastAction = "Update failed: " + err;
+    ctx.uiRuntime->showToast("Firmware", err + " (current firmware kept)", 2400, backgroundTick);
+    return;
+  }
+
+  rebootAfterInstall(ctx, backgroundTick);
 }
 
-bool installDownloaded(AppContext &ctx,
-                       const std::function<void()> &backgroundTick,
-                       String *error) {
-  OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Flashing firmware...", 0);
-  return installFirmwareFromSd(kLatestFirmwarePath,
-                               backgroundTick,
-                               [&](size_t written, size_t total) {
-                                 int percent = -1;
-                                 if (total > 0) {
-                                   percent = static_cast<int>((written * 100ULL) / total);
-                                 }
-                                 const String progressText =
-                                     "Flashing " + formatBytes(static_cast<uint64_t>(written)) +
-                                     " / " + formatBytes(static_cast<uint64_t>(total));
-                                 overlay.update("Firmware Update", progressText, percent);
-                               },
-                               error);
+void downloadPackageToSd(AppContext &ctx,
+                         UpdateSession &session,
+                         const std::function<void()> &backgroundTick) {
+  if (!checkLatest(ctx, session, backgroundTick)) {
+    return;
+  }
+  const ReleaseInfo &info = session.latest;
+
+  String err;
+  String expectedSha;
+  uint32_t downloaded = 0;
+  bool ok = fetchExpectedSha256(info, expectedSha, &err);
+  if (ok) {
+    OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Preparing download...", -1);
+    ok = downloadToSd(info,
+                      expectedSha,
+                      backgroundTick,
+                      [&](uint32_t written, uint32_t total) {
+                        overlay.update("Firmware Update",
+                                       progressText("Downloading", written, total),
+                                       percentOf(written, total));
+                      },
+                      &downloaded,
+                      &err);
+  }
+  if (!ok) {
+    session.lastAction = "Download failed: " + err;
+    ctx.uiRuntime->showToast("Firmware", err, 2000, backgroundTick);
+    return;
+  }
+
+  session.lastAction = "Saved " + info.tag + " (" + formatBytes(downloaded) +
+                       (expectedSha.isEmpty() ? ", unverified)" : ", verified)");
+  ctx.uiRuntime->showToast("Firmware", "Saved to /firmware/latest.bin", 1600, backgroundTick);
+}
+
+void installPackageFromSd(AppContext &ctx,
+                          UpdateSession &session,
+                          const std::function<void()> &backgroundTick) {
+  uint32_t size = 0;
+  if (!ensureSdMounted(false, nullptr) || !statSdFile(kLatestFirmwarePath, size)) {
+    ctx.uiRuntime->showToast("Firmware", "Downloaded package not found", 1700, backgroundTick);
+    return;
+  }
+
+  const String tag = readSmallSdFile(kLatestTagPath);
+  const String label = tag.isEmpty() ? String("/firmware/latest.bin") : tag;
+  if (!confirmInstall(ctx,
+                      "Install Firmware",
+                      "Flash " + label + " (" + formatBytes(size) + ")?",
+                      backgroundTick)) {
+    return;
+  }
+
+  String err;
+  bool ok = false;
+  {
+    OverlayScope overlay(ctx.uiRuntime, "Firmware Update", "Flashing firmware...", 0);
+    ok = flashFromSd(backgroundTick,
+                     [&](uint32_t written, uint32_t total) {
+                       overlay.update("Firmware Update",
+                                      progressText("Flashing", written, total),
+                                      percentOf(written, total));
+                     },
+                     &err);
+  }
+  if (!ok) {
+    session.lastAction = "Install failed: " + err;
+    ctx.uiRuntime->showToast("Firmware", err, 2000, backgroundTick);
+    return;
+  }
+
+  rebootAfterInstall(ctx, backgroundTick);
+}
+
+void showLatest(AppContext &ctx,
+                UpdateSession &session,
+                const std::function<void()> &backgroundTick) {
+  if (!checkLatest(ctx, session, backgroundTick)) {
+    return;
+  }
+  const ReleaseInfo &info = session.latest;
+  const bool newer = isNewerThanCurrent(info.tag);
+  session.lastAction = "Checked: " + info.tag;
+
+  std::vector<String> lines;
+  lines.push_back(newer ? "Update available" : "Up to date");
+  lines.push_back("Current: " + currentVersion());
+  lines.push_back("Latest: " + info.tag + (info.prerelease ? " (pre)" : ""));
+  lines.push_back("Asset: " + trimMiddle(info.assetName, 34));
+  lines.push_back("Size: " + formatBytes(info.size));
+  lines.push_back("SHA-256: " + String(info.sha256Url.isEmpty() ? "not published" : "published"));
+  ctx.uiRuntime->showInfo("Latest Firmware", lines, backgroundTick, "OK/BACK Exit");
+
+  if (newer && ctx.uiRuntime->confirm("Update Available",
+                                      "Install " + info.tag + " now?",
+                                      backgroundTick,
+                                      "Update",
+                                      "Later")) {
+    updateOverTheAir(ctx, session, backgroundTick);
+  }
 }
 
 }  // namespace
 
 void runFirmwareUpdateApp(AppContext &ctx,
                           const std::function<void()> &backgroundTick) {
+  enum class Action { Status, Check, UpdateNow, DownloadSd, InstallSd, Back };
+
   int selected = 0;
-  String lastAction;
-  String lastTag;
-  String lastAsset;
+  UpdateSession session;
 
   while (true) {
-    uint32_t latestSize = 0;
-    const bool latestExists = ensureSdMounted(false, nullptr) &&
-                              statSdFile(kLatestFirmwarePath, latestSize);
-
     std::vector<String> menu;
+    std::vector<Action> actions;
     menu.push_back("Status");
-    menu.push_back("Check Latest");
-    menu.push_back("Download Latest");
-    menu.push_back(String("Install Downloaded ") +
-                   (latestExists ? "(" + formatBytes(latestSize) + ")" : "(missing)"));
-    menu.push_back("Update Now");
+    actions.push_back(Action::Status);
+    menu.push_back("Check for Update");
+    actions.push_back(Action::Check);
+    menu.push_back("Update Now (Wi-Fi)");
+    actions.push_back(Action::UpdateNow);
+#if HAL_HAS_SD_CARD
+    uint32_t sdSize = 0;
+    const bool sdPackage = ensureSdMounted(false, nullptr) &&
+                           statSdFile(kLatestFirmwarePath, sdSize);
+    menu.push_back("Download to SD");
+    actions.push_back(Action::DownloadSd);
+    menu.push_back(String("Install from SD ") +
+                   (sdPackage ? "(" + formatBytes(sdSize) + ")" : "(missing)"));
+    actions.push_back(Action::InstallSd);
+#endif
     menu.push_back("Back");
+    actions.push_back(Action::Back);
 
     const int choice = ctx.uiRuntime->menuLoop("Firmware Update",
                                                 menu,
                                                 selected,
                                                 backgroundTick,
                                                 "OK Select  BACK Exit",
-                                                "Repo: " + trimMiddle(String(kFirmwareRepoSlug), 22));
-    if (choice < 0 || choice == 5) {
+                                                trimMiddle(currentVersion() + " / " + buildEnvName(), 26));
+    if (choice < 0 || choice >= static_cast<int>(actions.size())) {
       return;
     }
     selected = choice;
 
-    if (choice == 0) {
-      showStatus(ctx, lastAction, lastTag, lastAsset, backgroundTick);
-      continue;
-    }
-
-    if (choice == 1) {
-      ReleaseInfo info;
-      String err;
-      if (!fetchLatestReleaseInfo(info, &err)) {
-        lastAction = "Latest check failed: " + err;
-        ctx.uiRuntime->showToast("Firmware", err, 1800, backgroundTick);
-        continue;
-      }
-
-      lastTag = info.tag;
-      lastAsset = info.assetName;
-      lastAction = "Latest: " + info.tag + " / " + info.assetName;
-
-      std::vector<String> lines;
-      lines.push_back("Tag: " + info.tag);
-      lines.push_back("Asset: " + info.assetName);
-      lines.push_back("Size: " + formatBytes(info.size));
-      lines.push_back("URL:");
-      lines.push_back(trimMiddle(info.downloadUrl, 38));
-      ctx.uiRuntime->showInfo("Latest Firmware", lines, backgroundTick, "OK/BACK Exit");
-      continue;
-    }
-
-    if (choice == 2) {
-      ReleaseInfo info;
-      String err;
-      uint32_t downloaded = 0;
-      if (!downloadLatest(ctx, info, downloaded, backgroundTick, &err)) {
-        lastAction = "Download failed: " + err;
-        ctx.uiRuntime->showToast("Firmware", err, 1800, backgroundTick);
-        continue;
-      }
-
-      lastTag = info.tag;
-      lastAsset = info.assetName;
-      lastAction = "Downloaded " + info.assetName + " (" + formatBytes(downloaded) + ")";
-      ctx.uiRuntime->showToast("Firmware", "Downloaded to /firmware/latest.bin", 1600, backgroundTick);
-      continue;
-    }
-
-    if (choice == 3) {
-      if (!latestExists) {
-        ctx.uiRuntime->showToast("Firmware", "Downloaded package not found", 1700, backgroundTick);
-        continue;
-      }
-      if (!confirmInstall(ctx,
-                          "Install Firmware",
-                          "Flash /firmware/latest.bin?",
-                          backgroundTick)) {
-        continue;
-      }
-
-      String err;
-      if (!installDownloaded(ctx, backgroundTick, &err)) {
-        lastAction = "Install failed: " + err;
-        ctx.uiRuntime->showToast("Firmware", err, 1900, backgroundTick);
-        continue;
-      }
-
-      ctx.uiRuntime->showToast("Firmware", "Install complete, rebooting", 1200, backgroundTick);
-      delay(300);
-      ESP.restart();
-      return;
-    }
-
-    if (choice == 4) {
-      if (!ctx.uiRuntime->confirm("Update Now",
-                                  "Download and install latest firmware?",
-                                  backgroundTick,
-                                  "Update",
-                                  "Cancel")) {
-        continue;
-      }
-
-      ReleaseInfo info;
-      String err;
-      uint32_t downloaded = 0;
-      if (!downloadLatest(ctx, info, downloaded, backgroundTick, &err)) {
-        lastAction = "Update failed: " + err;
-        ctx.uiRuntime->showToast("Firmware", err, 1900, backgroundTick);
-        continue;
-      }
-
-      lastTag = info.tag;
-      lastAsset = info.assetName;
-      lastAction = "Downloaded " + info.assetName + " (" + formatBytes(downloaded) + ")";
-
-      if (!confirmInstall(ctx,
-                          "Install Latest",
-                          "Install downloaded latest firmware?",
-                          backgroundTick)) {
-        lastAction = "Latest downloaded (install canceled)";
-        continue;
-      }
-
-      if (!installDownloaded(ctx, backgroundTick, &err)) {
-        lastAction = "Install failed: " + err;
-        ctx.uiRuntime->showToast("Firmware", err, 1900, backgroundTick);
-        continue;
-      }
-
-      ctx.uiRuntime->showToast("Firmware", "Update complete, rebooting", 1200, backgroundTick);
-      delay(300);
-      ESP.restart();
-      return;
+    switch (actions[choice]) {
+      case Action::Status:
+        showStatus(ctx, session, backgroundTick);
+        break;
+      case Action::Check:
+        showLatest(ctx, session, backgroundTick);
+        break;
+      case Action::UpdateNow:
+        updateOverTheAir(ctx, session, backgroundTick);
+        break;
+      case Action::DownloadSd:
+        downloadPackageToSd(ctx, session, backgroundTick);
+        break;
+      case Action::InstallSd:
+        installPackageFromSd(ctx, session, backgroundTick);
+        break;
+      case Action::Back:
+        return;
     }
   }
 }

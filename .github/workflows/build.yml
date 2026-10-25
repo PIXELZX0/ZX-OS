@@ -41,6 +41,8 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Build firmware
+        env:
+          ZX_FW_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
         run: pio run -e ${{ matrix.env }}
 
       - name: Package build artifacts

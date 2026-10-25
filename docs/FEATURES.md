@@ -85,11 +85,16 @@ Settings is split into four major sections.
 
 #### Firmware Update
 
-- Show firmware update status.
-- Check latest firmware metadata.
-- Download latest firmware package to SD (`/firmware/latest.bin`).
-- Install downloaded package.
-- Update now (network-driven flow, then reboot).
+- Show firmware update status (running version, board env, OTA slot size, SD package).
+- Check for update: compares the running version with the latest GitHub release
+  and offers to install when a newer one exists.
+- Update now (Wi-Fi): streams this board's image (`openclaw-<env>-<tag>.bin`)
+  straight into the OTA partition, so no SD card is required.
+- Download to SD (`/firmware/latest.bin`) and install from SD (SD boards only).
+- Every image is checked against the release's `.sha256` asset; the new firmware
+  is only committed when the hash matches, otherwise the current one keeps booting.
+- The running version and target repository are injected at build time by
+  `scripts/firmware_version.py` (`ZX_FW_VERSION`, `ZX_FW_REPO` env vars; CI sets them).
 
 ### 2.3 File Explorer
 

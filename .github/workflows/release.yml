@@ -86,6 +86,8 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Build firmware
+        env:
+          ZX_FW_VERSION: ${{ env.RELEASE_TAG }}
         run: pio run -e "${{ matrix.env }}"
 
       - name: Package release assets
